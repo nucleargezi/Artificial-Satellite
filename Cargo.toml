@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/yrs-core", "crates/yrs-cli"]
+resolver = "2"

@@ -1,0 +1,3 @@
+template_source = "0.cpp"
+catalog_roots = [".wait"]
+bundle_output = "pre_zip.cpp"
