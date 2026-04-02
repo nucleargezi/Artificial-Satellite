@@ -13,6 +13,12 @@
 
 ## 安装与运行
 
+```bash
+cargo install --path crates/yrs-cli
+
+cargo uninstall yrs-cli
+```
+
 查看全部命令：
 
 ```bash
