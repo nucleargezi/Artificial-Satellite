@@ -1,3 +1,4 @@
 template_source = "0.cpp"
-catalog_roots = [".wait"]
+catalog_root = ".wait"
+record_root = "/home/yorisou/Yorisou_proj/cpcli/record"
 bundle_output = "pre_zip.cpp"
