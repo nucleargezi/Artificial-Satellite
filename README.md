@@ -50,25 +50,25 @@ bundle_output = "pre_zip.cpp"
 检查当前配置是否生效：
 
 ```bash
-cargo run -p yrs-cli -- check
+yrs-cli check
 ```
 
 把 `.wait` 中的代码移动到 `record`，并更新 `summary.md`：
 
 ```bash
-cargo run -p yrs-cli -- move
+yrs-cli move
 ```
 
 用模板文件覆盖当前目录最近修改的 `.cpp`：
 
 ```bash
-cargo run -p yrs-cli -- cover-latest
+yrs-cli cover-latest
 ```
 
 展开当前目录最近修改的 `.cpp` 的本地头文件，并复制到剪贴板：
 
 ```bash
-cargo run -p yrs-cli -- bundle
+yrs-cli bundle
 ```
 
 ## 一个典型工作流
