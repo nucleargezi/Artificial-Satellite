@@ -1,5 +1,12 @@
+library_root = "/home/yorisou/Yorisou_alg_space/"
 template_source = "0.cpp"
 catalog_root = ".wait"
-record_root = "/home/yorisou/Yorisou_proj/cpcli/record"
+record_root = "/home/yorisou/Yorisou_record/"
 summary_file = "summary.md"
 bundle_output = "pre_zip.cpp"
+
+[submit]
+base_url = "https://icpc.bjtu.edu.cn"
+cookie = "pk_at_bjtu_session=aaa; XSRF-TOKEN=bbb"
+timeout_secs = 60
+poll_interval_secs = 1.0
