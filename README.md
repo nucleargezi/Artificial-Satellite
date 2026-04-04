@@ -37,6 +37,7 @@ cargo run -p yrs-cli -- --help
 项目通过当前目录下的 `yrs.toml` 读取配置。一个最小示例如下：
 
 ```toml
+library_root = "/absolute/path/to/headers"
 template_source = "0.cpp"
 catalog_root = ".wait"
 record_root = "record"
@@ -52,6 +53,7 @@ poll_interval_secs = 1.0
 
 字段说明：
 
+- `library_root`：头文件根目录，必须使用绝对路径。`bundle` 和 `submit` 只会从这个目录展开本地 `#include "..."`，include 路径需要相对于这个目录书写。
 - `catalog_root`：待归档代码目录，`move` 会从这里搬运文件。
 - `record_root`：归档目录，历史代码和摘要文件都位于这里。
 - `summary_file`：历史摘要文件名，必须是 `record_root` 下的文件名，不能写成嵌套路径。
@@ -106,11 +108,12 @@ yrs-cli submit --problem 9584 --source main.cpp --lang "GNU C++ 11.4.0"
 ## 注意事项
 
 - 当前目录缺少 `yrs.toml` 时，CLI 会直接报错退出。
+- `library_root` 是必填项，且必须是绝对路径。
 - `cover-latest` 会直接覆盖当前工作区中最新修改的 `.cpp` 文件，请在确认后使用。
 - `move` 是“移动”而不是“复制”；文件会从 `catalog_root` 挪到 `record_root`。
-- `bundle` 当前依赖 `clip.exe`，更适合 Windows / WSL 环境。
+- `bundle` 当前依赖 `clip.exe`，更适合 Windows / WSL 环境；本地头文件只会从 `library_root` 展开。
 - `bundle` 目前是复制到剪贴板，不会直接写出打包文件。
-- `submit` 会读取 `yrs.toml` 里的原始 Cookie 字符串；请自行保护好配置文件中的登录态。
+- `submit` 会读取 `yrs.toml` 里的原始 Cookie 字符串；请自行保护好配置文件中的登录态。提交前的源码展开同样只会从 `library_root` 查找本地头文件。
 - `submit` 当前只支持这个 PK OJ，不做多 OJ 适配。
 
 ## 项目结构
