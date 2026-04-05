@@ -53,7 +53,7 @@ poll_interval_secs = 1.0
 
 [template_test]
 template_repo_root = "/absolute/path/to/YRS"
-state_file = ".yrs/test_template/state.json"
+state_file = ".yrs/test_template/state.toml"
 default_language = "GNU C++ 11.4.0"
 ```
 
@@ -107,10 +107,10 @@ yrs-cli bundle
 yrs-cli submit --problem 9584 --source main.cpp --lang "GNU C++ 11.4.0"
 ```
 
-根据模板仓库的变更范围跑受影响测试，并输出 JSON 摘要：
+根据模板仓库的变更范围跑受影响测试，并输出 TOML 报告：
 
 ```bash
-yrs-cli test_template --base origin/main --head HEAD --json
+yrs-cli test_template --base origin/main --head HEAD --toml
 ```
 
 强制全量重跑模板测试：
@@ -134,20 +134,21 @@ yrs-cli test_template --base origin/main --filter "test/fps/" --max-cases 2
 3. 复用现有 bundler 的 include 展开逻辑，重建每个测试的传递 `.hpp` 头文件依赖。
 4. 选出“测试文件本身改动”或“依赖头文件改动”的测试。
 5. 顺序提交这些测试到 PK OJ。
-6. 重写状态快照到 `state_file`。
+6. 重写 TOML 状态报告到 `state_file`。
 
 测试文件约定：
 
 - 测试源文件必须位于模板仓库的 `test/**/*.cpp`。
 - 首行需要写成 `// https://.../problem/<id>`。
 - 依赖触发只认模板仓库中的 `.hpp` 文件；其他后缀即使被 `#include`，也不会作为回归触发条件。
-- 如果某个测试文件的首行 URL 非法，它不会被提交，但会以 `invalid` 状态记录到快照，并让本次命令以失败结束。
+- 如果某个测试文件的首行 URL 非法，它不会被提交，但会以 `invalid` 状态记录到报告，并让本次命令以失败结束。
+- 每次运行都会额外汇总模板覆盖情况，把非 `test/` 目录下的 `.hpp` 模板分成 `all_passed`、`has_failures` 和 `unused` 三类。
 
 常用参数：
 
 - `--base <rev>`：必填，`git diff` 的 base revision。
 - `--head <rev>`：可选，默认 `HEAD`。
-- `--json`：把本次运行摘要打印为 JSON。
+- `--toml`：把本次运行报告打印为 TOML。
 - `--all`：忽略 diff 结果，直接重跑所有已发现测试。
 - `--filter <pattern>`：按测试相对路径做区分大小写的子串过滤。
 - `--max-cases <n>`：在过滤后的选中集合上再截断前 `n` 个测试。
@@ -165,7 +166,7 @@ yrs-cli test_template --base origin/main --filter "test/fps/" --max-cases 2
 3. 运行 `cover-latest`，用模板快速回填当前最新的题解文件。
 4. 运行 `bundle`，展开本地头文件并直接复制提交内容。
 5. 运行 `submit`，显式指定题号、入口文件和语言，等待 OJ 返回最终结果。
-6. 在模板仓库改动后，运行 `test_template` 做一轮受影响测试回归，并保留 `state.json` 供后续静态页面或 CI 使用。
+6. 在模板仓库改动后，运行 `test_template` 做一轮受影响测试回归，并保留 `state.toml` 供后续静态页面或 CI 使用。
 
 ## 注意事项
 

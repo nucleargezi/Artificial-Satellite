@@ -2248,6 +2248,7 @@ dependencies = [
  "filetime",
  "serde_json",
  "tempfile",
+ "toml",
  "yrs-core",
  "yrs-test-support",
 ]

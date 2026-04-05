@@ -7,6 +7,11 @@ bundle_output = "pre_zip.cpp"
 
 [submit]
 base_url = "https://icpc.bjtu.edu.cn"
-cookie = "pk_at_bjtu_session=aaa; XSRF-TOKEN=bbb"
-timeout_secs = 60
+cookie = "pk_at_bjtu_session=aaa%3D%3D; XSRF-TOKEN=bbb%3D"
+timeout_secs = 200
 poll_interval_secs = 1.0
+
+[template_test]
+template_repo_root = "/home/yorisou/Yorisou_alg_space/YRS"
+state_file = "/home/yorisou/Yorisou_alg_space/YRS/test/state.toml"
+default_language = "GNU C++ 11.4.0"
