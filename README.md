@@ -68,7 +68,7 @@ default_language = "GNU C++ 11.4.0"
 - `[submit]`：PK OJ 提交配置。
 - `submit.base_url`：OJ 根地址，例如 `https://icpc.bjtu.edu.cn`。
 - `submit.cookie`：直接写入请求头的原始 Cookie 字符串。
-- `submit.timeout_secs`：等待最终 verdict 的总超时时间，默认 `30` 秒。
+- `submit.timeout_secs`：单次提交流程的等待上限，默认 `30` 秒。
 - `submit.poll_interval_secs`：轮询状态页的间隔，默认 `1.0` 秒。
 - `[template_test]`：模板测试配置。
 - `template_test.template_repo_root`：模板仓库根目录，必须是绝对路径、必须是一个 git 仓库根目录，并且需要位于 `library_root` 之下。
@@ -131,7 +131,7 @@ yrs-cli test_template --base origin/main --filter "test/fps/" --max-cases 2
 
 1. 读取 `git diff <base>...<head>` 的变更路径。
 2. 扫描 `test/**/*.cpp`。
-3. 复用现有 bundler 的 include 展开逻辑，重建每个测试的传递头文件依赖。
+3. 复用现有 bundler 的 include 展开逻辑，重建每个测试的传递 `.hpp` 头文件依赖。
 4. 选出“测试文件本身改动”或“依赖头文件改动”的测试。
 5. 顺序提交这些测试到 PK OJ。
 6. 重写状态快照到 `state_file`。
@@ -140,6 +140,7 @@ yrs-cli test_template --base origin/main --filter "test/fps/" --max-cases 2
 
 - 测试源文件必须位于模板仓库的 `test/**/*.cpp`。
 - 首行需要写成 `// https://.../problem/<id>`。
+- 依赖触发只认模板仓库中的 `.hpp` 文件；其他后缀即使被 `#include`，也不会作为回归触发条件。
 - 如果某个测试文件的首行 URL 非法，它不会被提交，但会以 `invalid` 状态记录到快照，并让本次命令以失败结束。
 
 常用参数：

@@ -4,6 +4,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -115,6 +116,50 @@ impl Drop for TestServer {
       let _ = handle.join();
     }
   }
+}
+
+pub fn git(repo: &Path, args: &[&str]) -> String {
+  let output = Command::new("git")
+    .arg("-C")
+    .arg(repo)
+    .args(args)
+    .output()
+    .unwrap();
+  assert!(
+    output.status.success(),
+    "git {:?} failed: {}",
+    args,
+    String::from_utf8_lossy(&output.stderr)
+  );
+  String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+pub fn init_git_repo(repo: &Path) {
+  fs::create_dir_all(repo).unwrap();
+  let _ = git(repo, &["init", "-q"]);
+}
+
+pub fn commit_all(repo: &Path, message: &str) -> String {
+  let _ = git(repo, &["add", "."]);
+  let output = Command::new("git")
+    .arg("-C")
+    .arg(repo)
+    .arg("-c")
+    .arg("user.name=Test")
+    .arg("-c")
+    .arg("user.email=test@example.com")
+    .arg("commit")
+    .arg("-q")
+    .arg("-m")
+    .arg(message)
+    .output()
+    .unwrap();
+  assert!(
+    output.status.success(),
+    "git commit failed: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+  git(repo, &["rev-parse", "HEAD"])
 }
 
 pub fn write_config(
