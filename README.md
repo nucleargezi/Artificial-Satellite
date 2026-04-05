@@ -17,6 +17,7 @@
 - `cover-latest`：用模板文件覆盖当前工作区里最新修改的 `.cpp` 文件。
 - `bundle`：找到当前工作区里最新修改的 `.cpp` 文件，展开本地 `#include "..."` 后复制到剪贴板。
 - `submit`：读取显式指定的源码入口文件，自动展开本地 `#include "..."` 后提交到 PK OJ，并等待最终评测结果。
+- `test_template`：扫描模板仓库下的 `test/**/*.cpp`，根据 `git diff` 和头文件依赖选出受影响的测试，顺序提交到 PK OJ，并写出状态快照。
 
 ## 安装与运行
 
@@ -49,6 +50,11 @@ base_url = "https://icpc.bjtu.edu.cn"
 cookie = "PHPSESSID=...; other=..."
 timeout_secs = 30
 poll_interval_secs = 1.0
+
+[template_test]
+template_repo_root = "/absolute/path/to/YRS"
+state_file = ".yrs/test_template/state.json"
+default_language = "GNU C++ 11.4.0"
 ```
 
 字段说明：
@@ -64,6 +70,10 @@ poll_interval_secs = 1.0
 - `submit.cookie`：直接写入请求头的原始 Cookie 字符串。
 - `submit.timeout_secs`：等待最终 verdict 的总超时时间，默认 `30` 秒。
 - `submit.poll_interval_secs`：轮询状态页的间隔，默认 `1.0` 秒。
+- `[template_test]`：模板测试配置。
+- `template_test.template_repo_root`：模板仓库根目录，必须是绝对路径、必须是一个 git 仓库根目录，并且需要位于 `library_root` 之下。
+- `template_test.state_file`：模板测试状态快照输出位置。绝对路径会直接使用；相对路径会解析到 `template_repo_root` 下。
+- `template_test.default_language`：`test_template` 默认使用的提交语言名称，需要能在目标 OJ 的语言列表里匹配到。
 
 ## 使用示例
 
@@ -97,6 +107,56 @@ yrs-cli bundle
 yrs-cli submit --problem 9584 --source main.cpp --lang "GNU C++ 11.4.0"
 ```
 
+根据模板仓库的变更范围跑受影响测试，并输出 JSON 摘要：
+
+```bash
+yrs-cli test_template --base origin/main --head HEAD --json
+```
+
+强制全量重跑模板测试：
+
+```bash
+yrs-cli test_template --base origin/main --all
+```
+
+只调试部分测试，并限制本次最多执行 2 个用例：
+
+```bash
+yrs-cli test_template --base origin/main --filter "test/fps/" --max-cases 2
+```
+
+## `test_template` 说明
+
+`test_template` 主要面向模板库仓库的回归验证场景。它会在 `template_test.template_repo_root` 下执行如下流程：
+
+1. 读取 `git diff <base>...<head>` 的变更路径。
+2. 扫描 `test/**/*.cpp`。
+3. 复用现有 bundler 的 include 展开逻辑，重建每个测试的传递头文件依赖。
+4. 选出“测试文件本身改动”或“依赖头文件改动”的测试。
+5. 顺序提交这些测试到 PK OJ。
+6. 重写状态快照到 `state_file`。
+
+测试文件约定：
+
+- 测试源文件必须位于模板仓库的 `test/**/*.cpp`。
+- 首行需要写成 `// https://.../problem/<id>`。
+- 如果某个测试文件的首行 URL 非法，它不会被提交，但会以 `invalid` 状态记录到快照，并让本次命令以失败结束。
+
+常用参数：
+
+- `--base <rev>`：必填，`git diff` 的 base revision。
+- `--head <rev>`：可选，默认 `HEAD`。
+- `--json`：把本次运行摘要打印为 JSON。
+- `--all`：忽略 diff 结果，直接重跑所有已发现测试。
+- `--filter <pattern>`：按测试相对路径做区分大小写的子串过滤。
+- `--max-cases <n>`：在过滤后的选中集合上再截断前 `n` 个测试。
+
+退出码约定：
+
+- `0`：命令运行完成，且本次没有失败或 `invalid` 测试。
+- `1`：命令运行完成，但至少有一个测试失败，或者扫描到非法测试文件。
+- `2`：系统级失败，例如配置缺失、git diff 失败、状态文件损坏或写入失败。
+
 ## 一个典型工作流
 
 1. 在工作区中编写或修改 `.cpp` 文件。
@@ -104,6 +164,7 @@ yrs-cli submit --problem 9584 --source main.cpp --lang "GNU C++ 11.4.0"
 3. 运行 `cover-latest`，用模板快速回填当前最新的题解文件。
 4. 运行 `bundle`，展开本地头文件并直接复制提交内容。
 5. 运行 `submit`，显式指定题号、入口文件和语言，等待 OJ 返回最终结果。
+6. 在模板仓库改动后，运行 `test_template` 做一轮受影响测试回归，并保留 `state.json` 供后续静态页面或 CI 使用。
 
 ## 注意事项
 
@@ -115,6 +176,8 @@ yrs-cli submit --problem 9584 --source main.cpp --lang "GNU C++ 11.4.0"
 - `bundle` 目前是复制到剪贴板，不会直接写出打包文件。
 - `submit` 会读取 `yrs.toml` 里的原始 Cookie 字符串；请自行保护好配置文件中的登录态。提交前的源码展开同样只会从 `library_root` 查找本地头文件。
 - `submit` 当前只支持这个 PK OJ，不做多 OJ 适配。
+- `test_template` 依赖 `git` 命令可用，并假定模板仓库本身是一个独立 git 仓库。
+- `test_template` 会把状态快照写回模板仓库目录；如果你在 CI 中使用它，记得保留或上传 `state_file`。
 
 ## 项目结构
 

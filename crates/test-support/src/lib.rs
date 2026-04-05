@@ -7,11 +7,12 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy)]
 pub enum Scenario {
   Success,
+  ConcurrentSuccess,
   SuccessMetaToken,
   SuccessLiveStatus,
   CompileErrorLiveStatus,
@@ -26,13 +27,24 @@ pub enum Scenario {
 #[derive(Default)]
 struct ServerState {
   submit_count: usize,
+  pre_submit_status_reads: usize,
   requests: Vec<RequestRecord>,
+  submitted_runs: Vec<SubmittedRun>,
 }
 
 #[derive(Clone)]
 struct RequestRecord {
   method: String,
   body: String,
+}
+
+#[derive(Clone)]
+struct SubmittedRun {
+  run_id: u32,
+  verdict: String,
+  grade: String,
+  time_text: String,
+  memory_text: String,
 }
 
 pub struct TestServer {
@@ -60,7 +72,10 @@ impl TestServer {
 
         match listener.accept() {
           Ok((mut stream, _)) => {
-            handle_connection(&mut stream, scenario, &thread_state)
+            let state = Arc::clone(&thread_state);
+            thread::spawn(move || {
+              handle_connection(&mut stream, scenario, &state)
+            });
           }
           Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
             thread::sleep(Duration::from_millis(10));
@@ -170,15 +185,13 @@ fn handle_connection(
   let path = parts.next().unwrap_or_default().to_string();
   let body = String::from_utf8(body).unwrap();
 
-  let mut locked = state.lock().unwrap();
-  locked.requests.push(RequestRecord {
+  state.lock().unwrap().requests.push(RequestRecord {
     method: method.clone(),
     body: body.clone(),
   });
 
   let (status, content_type, response_body) =
-    route_request(&method, &path, scenario, &mut locked);
-  drop(locked);
+    route_request(&method, &path, scenario, state);
 
   write_response(stream, status, content_type, &response_body);
 }
@@ -187,28 +200,15 @@ fn route_request(
   method: &str,
   path: &str,
   scenario: Scenario,
-  state: &mut ServerState,
+  state: &Arc<Mutex<ServerState>>,
 ) -> (&'static str, &'static str, String) {
-  match (method, path) {
-    ("GET", "/problem/9584") => (
-      "200 OK",
-      "text/html; charset=utf-8",
-      problem_page_html(scenario),
-    ),
-    ("GET", "/problem/status") => (
-      "200 OK",
-      "text/html; charset=utf-8",
-      status_page_html(scenario, state.submit_count > 0),
-    ),
-    ("POST", "/problem/submit/9584") => {
-      state.submit_count += 1;
-      (
+  if let Some(run_id) = path_run_id(path, "/ajax/judge-detail/") {
+    return match scenario {
+      Scenario::ConcurrentSuccess => (
         "200 OK",
-        "text/html; charset=utf-8",
-        "submitted".to_string(),
-      )
-    }
-    ("GET", "/ajax/judge-detail/101") => match scenario {
+        "application/json",
+        format!(r#"{{"code":0,"data":"All tests passed for {run_id}"}}"#),
+      ),
       Scenario::Success
       | Scenario::SuccessMetaToken
       | Scenario::SuccessLiveStatus => (
@@ -229,8 +229,11 @@ fn route_request(
         "application/json",
         r#"{"code":0,"data":"Not available"}"#.to_string(),
       ),
-    },
-    ("GET", "/ajax/compile-error/101") => match scenario {
+    };
+  }
+
+  if let Some(_run_id) = path_run_id(path, "/ajax/compile-error/") {
+    return match scenario {
       Scenario::DetailFailure => (
         "200 OK",
         "application/json",
@@ -241,8 +244,11 @@ fn route_request(
         "application/json",
         r#"{"code":0,"data":"Not available"}"#.to_string(),
       ),
-    },
-    ("GET", "/ajax/runtime-error/101") => match scenario {
+    };
+  }
+
+  if let Some(_run_id) = path_run_id(path, "/ajax/runtime-error/") {
+    return match scenario {
       Scenario::RuntimeError => (
         "200 OK",
         "application/json",
@@ -253,9 +259,67 @@ fn route_request(
         "application/json",
         r#"{"code":0,"data":"Not available"}"#.to_string(),
       ),
-    },
+    };
+  }
+
+  match (method, path) {
+    ("GET", "/problem/9584") => (
+      "200 OK",
+      "text/html; charset=utf-8",
+      problem_page_html(scenario),
+    ),
+    ("GET", "/problem/status") => {
+      let mut locked = state.lock().unwrap();
+      if matches!(scenario, Scenario::ConcurrentSuccess)
+        && locked.submit_count == 0
+      {
+        locked.pre_submit_status_reads += 1;
+      }
+      (
+        "200 OK",
+        "text/html; charset=utf-8",
+        status_page_html(scenario, &locked),
+      )
+    }
+    ("POST", "/problem/submit/9584") => {
+      if matches!(scenario, Scenario::ConcurrentSuccess) {
+        let start = Instant::now();
+        loop {
+          if state.lock().unwrap().pre_submit_status_reads >= 2
+            || start.elapsed() >= Duration::from_millis(100)
+          {
+            break;
+          }
+          thread::sleep(Duration::from_millis(5));
+        }
+      }
+
+      let mut locked = state.lock().unwrap();
+      locked.submit_count += 1;
+      if matches!(scenario, Scenario::ConcurrentSuccess) {
+        let run_id = 100 + locked.submit_count as u32;
+        locked.submitted_runs.push(SubmittedRun {
+          run_id,
+          verdict: "Accepted".to_string(),
+          grade: "100".to_string(),
+          time_text: "31 ms".to_string(),
+          memory_text: "4096 KB".to_string(),
+        });
+      }
+      (
+        "200 OK",
+        "text/html; charset=utf-8",
+        "submitted".to_string(),
+      )
+    }
     _ => ("404 Not Found", "text/plain", "missing".to_string()),
   }
+}
+
+fn path_run_id(path: &str, prefix: &str) -> Option<u32> {
+  path
+    .strip_prefix(prefix)
+    .and_then(|tail| tail.parse::<u32>().ok())
 }
 
 fn write_response(
@@ -323,7 +387,7 @@ fn problem_page_html(scenario: Scenario) -> String {
   )
 }
 
-fn status_page_html(scenario: Scenario, submitted: bool) -> String {
+fn status_page_html(scenario: Scenario, state: &ServerState) -> String {
   let mut rows = vec![status_row_html(
     100,
     "SomeoneElse",
@@ -336,21 +400,35 @@ fn status_page_html(scenario: Scenario, submitted: bool) -> String {
     "1024 KB",
   )];
 
-  if submitted {
+  if matches!(scenario, Scenario::ConcurrentSuccess) {
+    for run in &state.submitted_runs {
+      rows.push(status_row_html(
+        run.run_id,
+        "Tester",
+        9584,
+        "Chosen",
+        "GNU C++ 11.4.0",
+        &run.verdict,
+        &run.grade,
+        &run.time_text,
+        &run.memory_text,
+      ));
+    }
+  } else if state.submit_count > 0 {
     match scenario {
-      Scenario::Success | Scenario::SuccessMetaToken => {
-        rows.push(status_row_html(
-          101,
-          "Tester",
-          9584,
-          "Chosen",
-          "GNU C++ 11.4.0",
-          "Accepted",
-          "100",
-          "31 ms",
-          "4096 KB",
-        ))
-      }
+      Scenario::Success
+      | Scenario::SuccessMetaToken
+      | Scenario::ConcurrentSuccess => rows.push(status_row_html(
+        101,
+        "Tester",
+        9584,
+        "Chosen",
+        "GNU C++ 11.4.0",
+        "Accepted",
+        "100",
+        "31 ms",
+        "4096 KB",
+      )),
       Scenario::DetailFailure => rows.push(status_row_html(
         101,
         "Tester",
