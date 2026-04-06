@@ -55,6 +55,7 @@ poll_interval_secs = 1.0
 template_repo_root = "/absolute/path/to/YRS"
 state_file = ".yrs/test_template/state.toml"
 default_language = "GNU C++ 11.4.0"
+blacklist = ["IO/fast_io.hpp"]
 ```
 
 字段说明：
@@ -74,6 +75,7 @@ default_language = "GNU C++ 11.4.0"
 - `template_test.template_repo_root`：模板仓库根目录，必须是绝对路径、必须是一个 git 仓库根目录，并且需要位于 `library_root` 之下。
 - `template_test.state_file`：模板测试状态快照输出位置。绝对路径会直接使用；相对路径会解析到 `template_repo_root` 下。
 - `template_test.default_language`：`test_template` 默认使用的提交语言名称，需要能在目标 OJ 的语言列表里匹配到。
+- `template_test.blacklist`：可选的头文件黑名单，列表中的路径必须是相对 `template_repo_root` 的 `.hpp` 路径。它们不会出现在测试依赖输出、模板覆盖列表和模板依赖图里，但这些文件的改动仍然会触发相关测试。
 
 ## 使用示例
 
@@ -141,8 +143,10 @@ yrs-cli test_template --base origin/main --filter "test/fps/" --max-cases 2
 - 测试源文件必须位于模板仓库的 `test/**/*.cpp`。
 - 首行需要写成 `// https://.../problem/<id>`。
 - 依赖触发只认模板仓库中的 `.hpp` 文件；其他后缀即使被 `#include`，也不会作为回归触发条件。
+- 如果某个 `.hpp` 被写进 `template_test.blacklist`，它仍然参与依赖触发判断，但不会出现在最终报告的依赖信息里。
 - 如果某个测试文件的首行 URL 非法，它不会被提交，但会以 `invalid` 状态记录到报告，并让本次命令以失败结束。
 - 每次运行都会额外汇总模板覆盖情况，把非 `test/` 目录下的 `.hpp` 模板分成 `all_passed`、`has_failures` 和 `unused` 三类。
+- TOML 报告中的 `tests.<case>.dependencies` 表示该测试可见的传递 `.hpp` 依赖；顶层 `template_dependencies` 则记录每个可见模板直接或间接依赖的所有可见 `.hpp` 头文件。
 
 常用参数：
 
