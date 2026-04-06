@@ -146,7 +146,9 @@ yrs-cli test_template --base origin/main --filter "test/fps/" --max-cases 2
 - 如果某个 `.hpp` 被写进 `template_test.blacklist`，它仍然参与依赖触发判断，但不会出现在最终报告的依赖信息里。
 - 如果某个测试文件的首行 URL 非法，它不会被提交，但会以 `invalid` 状态记录到报告，并让本次命令以失败结束。
 - 每次运行都会额外汇总模板覆盖情况，把非 `test/` 目录下的 `.hpp` 模板分成 `all_passed`、`has_failures` 和 `unused` 三类。
-- TOML 报告中的 `tests.<case>.dependencies` 表示该测试可见的传递 `.hpp` 依赖；顶层 `template_dependencies` 则记录每个可见模板直接或间接依赖的所有可见 `.hpp` 头文件。
+- TOML 报告中的 `tests.<case>.dependencies` 表示该测试可见的传递 `.hpp` 依赖。
+- 顶层 `template_dependencies` 记录“每个可见模板依赖哪些可见头文件”。
+- 顶层 `template_dependents` 记录“每个可见头文件被哪些可见头文件直接或间接依赖”，它和 `template_dependencies` 是同一张可见依赖图的反向索引。
 
 常用参数：
 
