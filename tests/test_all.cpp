@@ -921,11 +921,372 @@ void test_cph_pack(const char *cli_bin) {
                     "shenzhen" / "M.cpp"));
 }
 
+void test_config_discover() {
+  TempDir tmp;
+  write_default_config(tmp.path);
+  fs::path nested = tmp.path / "2023 ccpc shenzhen" / "sub";
+  fs::create_directories(nested);
+
+  auto found = yrs::AppConfig::discover_for_dir(nested);
+  assert(found.has_value());
+  assert(found->workspace_root == yrs::normalize_path(tmp.path));
+  assert(found->catalog_root == yrs::normalize_path(tmp.path) / ".wait");
+
+  TempDir no_cfg;
+  fs::path orphan_sub = no_cfg.path / "a" / "b";
+  fs::create_directories(orphan_sub);
+  if (!fs::exists("/yrs.toml") && !fs::exists("/tmp/yrs.toml")) {
+    auto missing = yrs::AppConfig::discover_for_dir(orphan_sub);
+    assert(!missing.has_value());
+    assert(missing.error().kind == yrs::ErrKind::NotFound);
+  }
+}
+
+void test_subdir_latest_and_cover(const char *cli_bin) {
+  TempDir tmp;
+  write_default_config(tmp.path);
+  auto tpl = write_file(tmp.path, "0.cpp", "// tpl\nint main() { return 0; }\n");
+  set_mtime(tpl, 9999);
+  write_file(tmp.path / "YRS", "lib.hpp", "#pragma once\nint lv = 11;\n");
+
+  auto cfg = yrs::AppConfig::load_for_dir(tmp.path).value();
+
+  // Only template_source exists -> must never pick 0.cpp
+  assert(!yrs::find_latest_active_cpp(cfg, tmp.path).value().has_value());
+  assert(!yrs::bundle_latest_cpp(cfg, tmp.path).has_value());
+  assert(!yrs::cover_latest_cpp(cfg, tmp.path).has_value());
+  assert(yrs::read_file_to_string(tpl).value() ==
+         "// tpl\nint main() { return 0; }\n");
+
+  auto root_a = write_file(tmp.path, "a.cpp", "int a() { return 1; }\n");
+  set_mtime(root_a, 10);
+  assert(yrs::normalize_path(
+             *yrs::find_latest_active_cpp(cfg, tmp.path).value()) ==
+         yrs::normalize_path(root_a));
+
+  auto ca = write_file(tmp.path / "contest_a", "A.cpp", "int ca() {}\n");
+  set_mtime(ca, 40);
+  auto cb = write_file(tmp.path / "contest_b", "M.cpp",
+                       "#include \"lib.hpp\"\nint cm() { return lv; }\n");
+  set_mtime(cb, 60);
+
+  // Newer files inside protected / hidden dirs must be strictly ignored
+  set_mtime(write_file(tmp.path / ".wait", "w.cpp", "int w() {}\n"), 500);
+  set_mtime(write_file(tmp.path / "record", "r.cpp", "int r() {}\n"), 600);
+  set_mtime(write_file(tmp.path / "YRS", "y.cpp", "int y() {}\n"), 700);
+  set_mtime(write_file(tmp.path / ".hidden", "h.cpp", "int h() {}\n"), 800);
+  set_mtime(write_file(tmp.path / "contest_b" / ".git", "g.cpp", "int g() {}\n"),
+            900);
+
+  // From workspace root: picks newest active file across subdirs (contest_b/M.cpp)
+  auto latest_root = yrs::find_latest_active_cpp(cfg, tmp.path).value();
+  assert(latest_root.has_value());
+  assert(yrs::normalize_path(*latest_root) == yrs::normalize_path(cb));
+
+  // From contest_a subdir: scoped strictly to contest_a (picks contest_a/A.cpp)
+  auto latest_ca =
+      yrs::find_latest_active_cpp(cfg, tmp.path / "contest_a").value();
+  assert(latest_ca.has_value());
+  assert(yrs::normalize_path(*latest_ca) == yrs::normalize_path(ca));
+
+  // Dry-run cover-latest does not modify file
+  auto dry_cov =
+      yrs::cover_latest_cpp(cfg, tmp.path / "contest_a", true).value();
+  assert(yrs::normalize_path(dry_cov) == yrs::normalize_path(ca));
+  assert(yrs::read_file_to_string(ca).value() == "int ca() {}\n");
+
+  // Real cover-latest inside contest_a covers contest_a/A.cpp, leaves contest_b/M.cpp
+  auto real_cov =
+      yrs::cover_latest_cpp(cfg, tmp.path / "contest_a", false).value();
+  assert(yrs::normalize_path(real_cov) == yrs::normalize_path(ca));
+  assert(yrs::read_file_to_string(ca).value() ==
+         "// tpl\nint main() { return 0; }\n");
+  assert(yrs::read_file_to_string(cb).value() ==
+         "#include \"lib.hpp\"\nint cm() { return lv; }\n");
+
+  // Protected directory refuses bundle / cover-latest
+  assert(!yrs::bundle_latest_cpp(cfg, tmp.path / "record").has_value());
+  assert(!yrs::cover_latest_cpp(cfg, tmp.path / ".wait").has_value());
+
+  if (cli_bin != nullptr) {
+    std::string abs_bin = fs::absolute(cli_bin).string();
+    fs::path bin_dir = tmp.path / "bin";
+    fs::create_directories(bin_dir);
+    fs::path wl_copy = bin_dir / "wl-copy";
+    write_file(bin_dir, "wl-copy",
+               "#!/bin/sh\n/bin/cat > \"$YRS_TEST_CLIPBOARD_CAPTURE\"\n");
+    ::chmod(wl_copy.c_str(), 0755);
+
+    fs::path cap = tmp.path / "sub_bundle_cap.txt";
+    std::string bcmd =
+        "cd \"" + (tmp.path / "contest_b").string() +
+        "\" && env -u DISPLAY -u WSL_DISTRO_NAME -u WSL_INTEROP "
+        "WAYLAND_DISPLAY=wayland-test PATH=\"" +
+        bin_dir.string() + "\" YRS_TEST_CLIPBOARD_CAPTURE=\"" + cap.string() +
+        "\" \"" + abs_bin + "\" bundle >/dev/null 2>&1";
+    assert(std::system(bcmd.c_str()) == 0);
+    assert(yrs::read_file_to_string(cap).value() ==
+           "int lv = 11;\nint cm() { return lv; }\n");
+
+    std::string chk_cmd = "cd \"" + (tmp.path / "contest_b").string() +
+                          "\" && \"" + abs_bin + "\" check >/dev/null 2>&1";
+    assert(std::system(chk_cmd.c_str()) == 0);
+
+    std::string cov_dry =
+        "cd \"" + (tmp.path / "contest_b").string() + "\" && \"" + abs_bin +
+        "\" cover-latest -n >/dev/null 2>&1";
+    assert(std::system(cov_dry.c_str()) == 0);
+    assert(yrs::read_file_to_string(cb).value() ==
+           "#include \"lib.hpp\"\nint cm() { return lv; }\n");
+
+    std::string stg_dot =
+        "cd \"" + (tmp.path / "contest_b").string() + "\" && \"" + abs_bin +
+        "\" stage . regional/2026/b >/dev/null 2>&1";
+    assert(std::system(stg_dot.c_str()) == 0);
+    assert(fs::exists(tmp.path / ".wait" / "regional" / "2026" / "b" /
+                      "M.cpp"));
+  }
+}
+
+void test_clean_unused(const char *cli_bin) {
+  TempDir tmp;
+  write_default_config(tmp.path);
+  std::string tpl_body = "#include \"YRS/all.hpp\"\nvoid solve() {}\nint main() {}\n";
+  auto tpl = write_file(tmp.path, "0.cpp", tpl_body);
+
+  std::string tc_unrun =
+      "{\"1\":{\"isDisabled\":false,\"result\":null}}";
+
+  // 1. Untouched single problem (with leading URL comment + CRLF)
+  auto u_single = write_file(
+      tmp.path, "P1001.cpp",
+      "// https://www.luogu.com.cn/problem/P1001\r\n"
+      "#include \"YRS/all.hpp\"\r\nvoid solve() {}\r\nint main() {}\r\n");
+  write_cph_bin(tmp, "P1001.cpp.bin", u_single, "P1001",
+                "https://www.luogu.com.cn/problem/P1001", tc_unrun);
+
+  // 2. Empty CPH file
+  auto u_empty = write_file(tmp.path, "P1002.cpp", "   \n");
+  write_cph_bin(tmp, "P1002.cpp.bin", u_empty, "P1002",
+                "https://www.luogu.com.cn/problem/P1002", tc_unrun);
+
+  // 3. Untouched contest problem
+  auto u_contest = write_file(tmp.path, "qoj8329.cpp", tpl_body);
+  write_cph_bin(tmp, "qoj8329.cpp.bin", u_contest, "B. Empty",
+                "https://qoj.ac/contest/1540/problem/8329", tc_unrun);
+
+  // 4. Untouched CPH problem in subdir (subdir should be pruned after removal)
+  auto u_sub = write_file(tmp.path / "abandoned_contest", "A.cpp", tpl_body);
+  write_cph_bin(tmp, "abandoned_contest/A.cpp.bin", u_sub, "A",
+                "https://codeforces.com/contest/2050/problem/A", tc_unrun);
+
+  // Must NOT be touched: modified CPH problem
+  auto mod_prob = write_file(tmp.path, "P2000.cpp", "int real_code = 42;\n");
+  write_cph_bin(tmp, "P2000.cpp.bin", mod_prob, "P2000",
+                "https://www.luogu.com.cn/problem/P2000", tc_unrun);
+
+  // Must NOT be touched: local file without .bin, even with identical template body
+  auto local_gen = write_file(tmp.path, "gen.cpp", tpl_body);
+
+  // Must NOT be touched: file inside protected .wait even if a stale .bin points to it
+  auto wait_f = write_file(tmp.path / ".wait" / "luogu", "P3000.cpp", tpl_body);
+  write_cph_bin(tmp, "wait_ref.cpp.bin", wait_f, "P3000",
+                "https://www.luogu.com.cn/problem/P3000", tc_unrun);
+
+  // Orphan .bin
+  write_cph_bin(tmp, "ghost.cpp.bin", tmp.path / "ghost.cpp", "Ghost",
+                std::nullopt, tc_unrun);
+
+  auto cfg = yrs::AppConfig::load_for_dir(tmp.path).value();
+
+  // Default clean (include_unused = false) only removes orphan .bin
+  auto only_orphan = yrs::cph::clean_cph_workspace(cfg, false, false).value();
+  assert(only_orphan.removed_bins.size() == 1);
+  assert(only_orphan.removed_unused.empty());
+  assert(!fs::exists(tmp.path / ".cph-ng" / "ghost.cpp.bin"));
+  assert(fs::exists(u_single) && fs::exists(u_empty) && fs::exists(u_contest) &&
+         fs::exists(u_sub));
+
+  // Add another orphan and test dry-run with include_unused = true
+  write_cph_bin(tmp, "ghost2.cpp.bin", tmp.path / "ghost2.cpp", "Ghost2",
+                std::nullopt, tc_unrun);
+  auto dry_u = yrs::cph::clean_cph_workspace(cfg, true, true).value();
+  assert(dry_u.removed_bins.size() == 1);
+  assert(dry_u.removed_unused.size() == 4);
+  assert(fs::exists(u_single) && fs::exists(u_sub));
+  assert(fs::exists(tmp.path / ".cph-ng" / "ghost2.cpp.bin"));
+
+  if (cli_bin != nullptr) {
+    std::string abs_bin = fs::absolute(cli_bin).string();
+    std::string dry_cli = "cd \"" + tmp.path.string() + "\" && \"" + abs_bin +
+                          "\" clean -un >/dev/null 2>&1";
+    assert(std::system(dry_cli.c_str()) == 0);
+    assert(fs::exists(u_single));
+
+    std::string real_cli = "cd \"" + tmp.path.string() + "\" && \"" + abs_bin +
+                           "\" clean -u >/dev/null 2>&1";
+    assert(std::system(real_cli.c_str()) == 0);
+  } else {
+    auto real_u = yrs::cph::clean_cph_workspace(cfg, false, true).value();
+    assert(real_u.removed_bins.size() == 1);
+    assert(real_u.removed_unused.size() == 4);
+  }
+
+  assert(!fs::exists(u_single));
+  assert(!fs::exists(tmp.path / ".cph-ng" / "P1001.cpp.bin"));
+  assert(!fs::exists(u_empty));
+  assert(!fs::exists(u_contest));
+  assert(!fs::exists(u_sub));
+  assert(!fs::exists(tmp.path / "abandoned_contest"));
+  assert(!fs::exists(tmp.path / ".cph-ng" / "abandoned_contest"));
+  assert(!fs::exists(tmp.path / ".cph-ng" / "ghost2.cpp.bin"));
+
+  // Immune files must all still exist
+  assert(fs::exists(tpl));
+  assert(fs::exists(mod_prob));
+  assert(fs::exists(tmp.path / ".cph-ng" / "P2000.cpp.bin"));
+  assert(fs::exists(local_gen));
+  assert(fs::exists(wait_f));
+}
+
+void test_workspace_status(const char *cli_bin) {
+  TempDir tmp;
+  write_default_config(tmp.path);
+  std::string tpl_body = "// template\nint main() {}\n";
+  set_mtime(write_file(tmp.path, "0.cpp", tpl_body), 1);
+
+  std::string tc_ac2 =
+      "{\"1\":{\"isDisabled\":false,\"result\":{\"verdict\":\"AC\"}},"
+      "\"2\":{\"isDisabled\":false,\"result\":{\"verdict\":\"AC\"}}}";
+  std::string tc_wa =
+      "{\"1\":{\"isDisabled\":false,\"result\":{\"verdict\":\"AC\"}},"
+      "\"2\":{\"isDisabled\":false,\"result\":{\"verdict\":\"WA\"}}}";
+  std::string tc_unrun =
+      "{\"1\":{\"isDisabled\":false,\"result\":null}}";
+
+  // Ready to stage
+  auto p_ac = write_file(tmp.path, "P2075.cpp", "int ac() { return 0; }\n");
+  set_mtime(p_ac, 100);
+  write_cph_bin(tmp, "P2075.cpp.bin", p_ac, "P2075",
+                "https://www.luogu.com.cn/problem/P2075", tc_ac2);
+
+  // Root contest with P2, P10, P3 (untouched) to verify natural label sort
+  auto q10 = write_file(tmp.path, "qoj8337.cpp", "int p10() {}\n");
+  set_mtime(q10, 110);
+  write_cph_bin(tmp, "qoj8337.cpp.bin", q10, "P10. Ten",
+                "https://qoj.ac/contest/1540/problem/8337", tc_ac2);
+
+  auto q2 = write_file(tmp.path, "qoj8329.cpp", "int p2() {}\n");
+  set_mtime(q2, 120);
+  write_cph_bin(tmp, "qoj8329.cpp.bin", q2, "P2. Two",
+                "https://qoj.ac/contest/1540/problem/8329", tc_wa);
+
+  auto q3_untouched = write_file(tmp.path, "qoj8330.cpp", tpl_body);
+  set_mtime(q3_untouched, 130);
+  write_cph_bin(tmp, "qoj8330.cpp.bin", q3_untouched, "P3. Empty",
+                "https://qoj.ac/contest/1540/problem/8330", tc_unrun);
+
+  // Subdir workspace (packed_cf/B.cpp has newest mtime 300)
+  auto sub_a = write_file(tmp.path / "packed_cf", "A.cpp", "int sa() {}\n");
+  set_mtime(sub_a, 200);
+  write_cph_bin(tmp, "packed_cf/A.cpp.bin", sub_a, "A",
+                "https://codeforces.com/contest/2050/problem/A", tc_ac2);
+
+  auto sub_b = write_file(tmp.path / "packed_cf", "B.cpp", "int sb() {}\n");
+  set_mtime(sub_b, 300);
+  write_cph_bin(tmp, "packed_cf/B.cpp.bin", sub_b, "B",
+                "https://codeforces.com/contest/2050/problem/B", tc_unrun);
+
+  // In progress singles: 1 WA + 1 standalone unrouted AC
+  auto p_wa = write_file(tmp.path, "P9999.cpp", "int wa() {}\n");
+  set_mtime(p_wa, 140);
+  write_cph_bin(tmp, "P9999.cpp.bin", p_wa, "P9999",
+                "https://www.luogu.com.cn/problem/P9999", tc_wa);
+
+  auto q_single_ac = write_file(tmp.path, "qoj9000.cpp", "int q9() {}\n");
+  set_mtime(q_single_ac, 150);
+  write_cph_bin(tmp, "qoj9000.cpp.bin", q_single_ac, "Standalone",
+                "https://qoj.ac/problem/9000", tc_ac2);
+
+  // Untouched single template
+  auto p_untouched = write_file(tmp.path, "P8000.cpp", tpl_body);
+  set_mtime(p_untouched, 160);
+  write_cph_bin(tmp, "P8000.cpp.bin", p_untouched, "P8000",
+                "https://www.luogu.com.cn/problem/P8000", tc_unrun);
+
+  // Local non-CPH file
+  set_mtime(write_file(tmp.path, "gen.cpp", "int gen() {}\n"), 170);
+
+  // Catalog (.wait) files + Orphan .bin
+  write_file(tmp.path / ".wait" / "luogu", "P1000.cpp", "int x() {}\n");
+  write_file(tmp.path / ".wait" / "regional" / "cn", "X.cpp", "int y() {}\n");
+  write_cph_bin(tmp, "dead.cpp.bin", tmp.path / "dead.cpp", "Dead",
+                std::nullopt, tc_unrun);
+
+  auto cfg = yrs::AppConfig::load_for_dir(tmp.path).value();
+  auto st = yrs::cph::inspect_workspace_status(cfg, tmp.path).value();
+
+  assert(st.latest_active_cpp.has_value());
+  assert(yrs::normalize_path(*st.latest_active_cpp) ==
+         yrs::normalize_path(sub_b));
+  assert(st.ready_to_stage.size() == 1);
+  assert(st.ready_to_stage[0].src_path.filename() == "P2075.cpp");
+
+  assert(st.root_contests.size() == 1);
+  assert(st.root_contests[0].info.key == "qoj:1540");
+  assert(st.root_contests[0].ac_count == 1);
+  assert(st.root_contests[0].wip_count == 1);
+  assert(st.root_contests[0].untouched_count == 1);
+  assert(st.root_contests[0].items.size() == 3);
+  // Natural sort: P2 < P3 < P10
+  assert(st.root_contests[0].items[0].label == "P2");
+  assert(st.root_contests[0].items[1].label == "P3");
+  assert(st.root_contests[0].items[2].label == "P10");
+
+  assert(st.subdir_workspaces.size() == 1);
+  assert(st.subdir_workspaces[0].rel_name == "packed_cf");
+  assert(st.subdir_workspaces[0].ac_count == 1);
+  assert(st.subdir_workspaces[0].wip_count == 1);
+
+  assert(st.in_progress_singles.size() == 2);
+  assert(st.untouched_singles.size() == 1);
+  assert(st.untouched_singles[0].src_path.filename() == "P8000.cpp");
+  assert(st.local_root_files.size() == 1);
+  assert(st.local_root_files[0].filename() == "gen.cpp");
+  assert(st.catalog_file_count == 2);
+  assert(st.orphan_bin_count == 1);
+  assert(st.total_unused_cph_count == 2);
+
+  std::string compact_out = yrs::cph::render_workspace_status(st, false);
+  assert(compact_out.find("packed_cf/B.cpp") != std::string::npos);
+  assert(compact_out.find("+ 1 untouched template(s)") != std::string::npos);
+  assert(compact_out.find("qoj8330.cpp") == std::string::npos);
+  assert(compact_out.find("WA 1/2") != std::string::npos);
+  assert(compact_out.find("AC 2/2, manual") != std::string::npos);
+
+  std::string verbose_out = yrs::cph::render_workspace_status(st, true);
+  assert(verbose_out.find("qoj8330.cpp -> P3.cpp") != std::string::npos);
+
+  if (cli_bin != nullptr) {
+    std::string abs_bin = fs::absolute(cli_bin).string();
+    fs::path out_file = tmp.path / "status_cli.txt";
+    std::string scmd = "cd \"" + (tmp.path / "packed_cf").string() +
+                       "\" && \"" + abs_bin + "\" status -v > \"" +
+                       out_file.string() + "\" 2>&1";
+    assert(std::system(scmd.c_str()) == 0);
+    std::string cli_rendered = yrs::read_file_to_string(out_file).value();
+    assert(cli_rendered.find("cwd") != std::string::npos);
+    assert(cli_rendered.find("qoj8330.cpp -> P3.cpp") != std::string::npos);
+  }
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
   test_config_load();
+  test_config_discover();
   test_latest_and_cover();
+  test_subdir_latest_and_cover(argc > 1 ? argv[1] : nullptr);
   test_bundle();
   test_move_and_history();
   test_paths_and_symlinks();
@@ -933,7 +1294,9 @@ int main(int argc, char **argv) {
   test_sigpipe_safety();
   test_gzip_and_json();
   test_cph_stage_and_clean(argc > 1 ? argv[1] : nullptr);
+  test_clean_unused(argc > 1 ? argv[1] : nullptr);
   test_cph_pack(argc > 1 ? argv[1] : nullptr);
+  test_workspace_status(argc > 1 ? argv[1] : nullptr);
   if (argc > 1) {
     test_cli_integration(argv[1]);
   }

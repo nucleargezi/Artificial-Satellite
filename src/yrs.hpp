@@ -380,7 +380,68 @@ struct AppConfig {
 
     return config;
   }
+
+  static Result<fs::path> find_workspace_root(const fs::path &start_dir) {
+    if (start_dir.empty()) {
+      return std::unexpected(
+          make_err(ErrKind::InvalidInput, "empty start directory"));
+    }
+    std::error_code ec;
+    fs::path cur = normalize_path(start_dir);
+    while (true) {
+      fs::path cand = cur / "yrs.toml";
+      if (fs::exists(cand, ec) && !fs::is_directory(cand, ec)) {
+        return cur;
+      }
+      ec.clear();
+      fs::path parent = cur.parent_path();
+      if (parent.empty() || parent == cur) break;
+      cur = std::move(parent);
+    }
+    return std::unexpected(make_err(
+        ErrKind::NotFound,
+        "missing yrs.toml in " + start_dir.string() +
+            " or any parent directory"));
+  }
+
+  static Result<AppConfig> discover_for_dir(const fs::path &start_dir) {
+    auto root_res = find_workspace_root(start_dir);
+    if (!root_res) return std::unexpected(root_res.error());
+    return load_for_dir(*root_res);
+  }
 };
+
+inline bool is_protected_workspace_dir(const AppConfig &config,
+                                       const fs::path &dir) {
+  fs::path norm_dir = normalize_path(dir);
+  fs::path norm_ws = normalize_path(config.workspace_root);
+  if (norm_dir == norm_ws) return false;
+
+  fs::path norm_cat = normalize_path(config.catalog_root);
+  fs::path norm_rec = normalize_path(config.record_root);
+  fs::path norm_lib = normalize_path(config.library_root);
+  fs::path norm_cph = normalize_path(config.workspace_root / ".cph-ng");
+  fs::path norm_yrs = normalize_path(config.workspace_root / "YRS");
+
+  if (path_starts_with(norm_dir, norm_cat) ||
+      path_starts_with(norm_dir, norm_rec) ||
+      path_starts_with(norm_dir, norm_cph) ||
+      path_starts_with(norm_dir, norm_yrs) ||
+      (norm_lib != norm_ws && path_starts_with(norm_dir, norm_lib))) {
+    return true;
+  }
+
+  if (path_starts_with(norm_dir, norm_ws)) {
+    fs::path rel = norm_dir.lexically_relative(norm_ws);
+    for (const auto &comp : rel) {
+      std::string s = comp.string();
+      if (!s.empty() && s != "." && s != ".." && s.front() == '.') {
+        return true;
+      }
+    }
+  }
+  return false;
+}
 
 // --- Latest ---
 
@@ -410,7 +471,96 @@ inline Result<std::optional<fs::path>> find_latest_cpp(const fs::path &dir) {
   return best->second;
 }
 
-inline Result<fs::path> cover_latest_cpp(const AppConfig &config) {
+namespace detail {
+
+struct MtimeCandidate {
+  int64_t sec;
+  int64_t nsec;
+  fs::path norm_path;
+  fs::path raw_path;
+
+  bool is_older_than(const MtimeCandidate &other) const {
+    if (sec != other.sec) return sec < other.sec;
+    if (nsec != other.nsec) return nsec < other.nsec;
+    return norm_path < other.norm_path;
+  }
+};
+
+inline Result<void> scan_latest_active_rec(
+    const fs::path &cur_dir, const AppConfig &config, const fs::path &norm_tpl,
+    std::optional<MtimeCandidate> &best) {
+  std::error_code ec;
+  fs::directory_iterator it(cur_dir, ec);
+  if (ec) return std::unexpected(make_err(ErrKind::Other, ec.message()));
+
+  for (const auto &entry : it) {
+    auto st = entry.symlink_status(ec);
+    if (ec) continue;
+    const fs::path &p = entry.path();
+
+    if (st.type() == fs::file_type::directory) {
+      if (!is_protected_workspace_dir(config, p)) {
+        auto sub_res = scan_latest_active_rec(p, config, norm_tpl, best);
+        if (!sub_res) return sub_res;
+      }
+      continue;
+    }
+
+    if (st.type() != fs::file_type::regular) continue;
+    if (p.extension() != ".cpp") continue;
+
+    fs::path norm_p = normalize_path(p);
+    if (norm_p == norm_tpl) continue;
+
+    struct stat sb{};
+    if (::stat(p.c_str(), &sb) != 0) {
+      return std::unexpected(from_errno(p.string()));
+    }
+    MtimeCandidate cand{
+        .sec = sb.st_mtim.tv_sec,
+        .nsec = sb.st_mtim.tv_nsec,
+        .norm_path = std::move(norm_p),
+        .raw_path = p,
+    };
+    if (!best || best->is_older_than(cand)) {
+      best = std::move(cand);
+    }
+  }
+  return {};
+}
+
+}  // namespace detail
+
+inline Result<std::optional<fs::path>> find_latest_active_cpp(
+    const AppConfig &config, const fs::path &cwd = {}) {
+  fs::path norm_ws = normalize_path(config.workspace_root);
+  fs::path search_root = config.workspace_root;
+
+  if (!cwd.empty()) {
+    fs::path norm_cwd = normalize_path(cwd);
+    if (path_starts_with(norm_cwd, norm_ws) && norm_cwd != norm_ws) {
+      if (is_protected_workspace_dir(config, norm_cwd)) {
+        return std::unexpected(make_err(
+            ErrKind::InvalidInput,
+            "refusing to operate inside protected directory: " +
+                norm_cwd.string()));
+      }
+      search_root = cwd;
+    }
+  }
+
+  fs::path norm_tpl = normalize_path(config.template_source);
+  std::optional<detail::MtimeCandidate> best;
+  auto scan_res =
+      detail::scan_latest_active_rec(search_root, config, norm_tpl, best);
+  if (!scan_res) return std::unexpected(scan_res.error());
+  if (!best) return std::nullopt;
+  return best->raw_path;
+}
+
+inline Result<fs::path> cover_latest_cpp(const AppConfig &config,
+                                         const fs::path &cwd = {},
+                                         bool dry_run = false) {
   std::error_code ec;
   if (!fs::is_regular_file(config.template_source, ec)) {
     return std::unexpected(
@@ -421,17 +571,19 @@ inline Result<fs::path> cover_latest_cpp(const AppConfig &config) {
   auto tpl_content = read_file_to_string(config.template_source);
   if (!tpl_content) return std::unexpected(tpl_content.error());
 
-  auto latest_res = find_latest_cpp(config.workspace_root);
+  auto latest_res = find_latest_active_cpp(config, cwd);
   if (!latest_res) return std::unexpected(latest_res.error());
   if (!latest_res->has_value()) {
+    fs::path scope = cwd.empty() ? config.workspace_root : cwd;
     return std::unexpected(
-        make_err(ErrKind::NotFound,
-                 "no cpp file in " + config.workspace_root.string()));
+        make_err(ErrKind::NotFound, "no cpp file in " + scope.string()));
   }
 
   const fs::path &target = **latest_res;
-  auto write_res = write_string_to_file(target, *tpl_content);
-  if (!write_res) return std::unexpected(write_res.error());
+  if (!dry_run) {
+    auto write_res = write_string_to_file(target, *tpl_content);
+    if (!write_res) return std::unexpected(write_res.error());
+  }
 
   return target;
 }
@@ -613,13 +765,14 @@ inline Result<BundledLatest> bundle_cpp_path(const AppConfig &config,
   };
 }
 
-inline Result<BundledLatest> bundle_latest_cpp(const AppConfig &config) {
-  auto latest_res = find_latest_cpp(config.workspace_root);
+inline Result<BundledLatest> bundle_latest_cpp(const AppConfig &config,
+                                               const fs::path &cwd = {}) {
+  auto latest_res = find_latest_active_cpp(config, cwd);
   if (!latest_res) return std::unexpected(latest_res.error());
   if (!latest_res->has_value()) {
+    fs::path scope = cwd.empty() ? config.workspace_root : cwd;
     return std::unexpected(
-        make_err(ErrKind::NotFound,
-                 "no cpp file in " + config.workspace_root.string()));
+        make_err(ErrKind::NotFound, "no cpp file in " + scope.string()));
   }
   return bundle_cpp_path(config, **latest_res);
 }
@@ -2227,6 +2380,10 @@ struct ProblemMeta {
   std::string name;
   std::optional<std::string> url;
   bool all_ac = false;
+  size_t enabled_tc = 0;
+  size_t ac_tc = 0;
+  size_t failed_tc = 0;
+  std::string first_fail_verdict;
 };
 
 struct StageEntry {
@@ -2240,8 +2397,14 @@ struct StageSummary {
   std::vector<StageEntry> entries;
 };
 
+struct UnusedProblemEntry {
+  fs::path src_path;
+  std::vector<fs::path> bin_paths;
+};
+
 struct CleanSummary {
   std::vector<fs::path> removed_bins;
+  std::vector<UnusedProblemEntry> removed_unused;
 };
 
 inline Result<ProblemMeta> read_cph_bin(const fs::path &bin_path) {
@@ -2291,7 +2454,9 @@ inline Result<ProblemMeta> read_cph_bin(const fs::path &bin_path) {
   if (const json::Value *tc_val = root->get("testcases")) {
     if (const json::Object *tcs = tc_val->as_obj()) {
       size_t enabled_cnt = 0;
-      bool all_passed = true;
+      size_t ac_cnt = 0;
+      size_t failed_cnt = 0;
+      std::string first_fail;
       for (const auto &[id, tc] : tcs->entries) {
         (void)id;
         if (const json::Value *dis = tc.get("isDisabled")) {
@@ -2299,13 +2464,24 @@ inline Result<ProblemMeta> read_cph_bin(const fs::path &bin_path) {
         }
         ++enabled_cnt;
         const json::Value *res = tc.get("result");
-        const json::Value *verdict = res ? res->get("verdict") : nullptr;
-        auto v_str = verdict ? verdict->as_str() : std::nullopt;
-        if (!v_str || *v_str != "AC") {
-          all_passed = false;
+        if (res && !res->is_null()) {
+          const json::Value *verdict = res->get("verdict");
+          if (auto v_str = verdict ? verdict->as_str() : std::nullopt;
+              v_str && !v_str->empty()) {
+            if (*v_str == "AC") {
+              ++ac_cnt;
+            } else {
+              ++failed_cnt;
+              if (first_fail.empty()) first_fail = std::string(*v_str);
+            }
+          }
         }
       }
-      meta.all_ac = (enabled_cnt > 0 && all_passed);
+      meta.enabled_tc = enabled_cnt;
+      meta.ac_tc = ac_cnt;
+      meta.failed_tc = failed_cnt;
+      meta.first_fail_verdict = std::move(first_fail);
+      meta.all_ac = (enabled_cnt > 0 && ac_cnt == enabled_cnt);
     }
   }
 
@@ -2758,8 +2934,7 @@ inline Result<StageSummary> stage_directory(const AppConfig &config,
   if (norm_src_dir == norm_ws || norm_src_dir == norm_cat ||
       norm_src_dir == norm_rec || norm_src_dir == norm_lib ||
       path_starts_with(norm_ws, norm_src_dir) ||
-      path_starts_with(norm_src_dir, norm_cat) ||
-      path_starts_with(norm_src_dir, norm_rec)) {
+      is_protected_workspace_dir(config, norm_src_dir)) {
     return std::unexpected(
         make_err(ErrKind::InvalidInput,
                  "refusing to stage protected directory: " +
@@ -2850,8 +3025,86 @@ inline Result<StageSummary> stage_directory(const AppConfig &config,
   return summary;
 }
 
-inline Result<CleanSummary> clean_orphan_cph_bins(const AppConfig &config,
-                                                  bool dry_run) {
+namespace detail {
+
+inline std::string strip_template_prelude(std::string_view content) {
+  std::string_view sv = content;
+  if (sv.starts_with("\xEF\xBB\xBF")) sv.remove_prefix(3);
+
+  auto nl = sv.find('\n');
+  std::string_view first_line =
+      (nl == std::string_view::npos) ? sv : sv.substr(0, nl);
+  std::string_view trimmed_first = trim_start(first_line);
+  if (trimmed_first.starts_with("//") &&
+      (trimmed_first.find("http://") != std::string_view::npos ||
+       trimmed_first.find("https://") != std::string_view::npos)) {
+    sv = (nl == std::string_view::npos) ? std::string_view{} : sv.substr(nl + 1);
+  }
+
+  std::string clean;
+  clean.reserve(sv.size());
+  for (char c : sv) {
+    if (c != '\r') clean.push_back(c);
+  }
+  return std::string(trim(clean));
+}
+
+inline bool natural_less(std::string_view a, std::string_view b) {
+  size_t ia = 0, ib = 0;
+  while (ia < a.size() && ib < b.size()) {
+    bool da = std::isdigit(static_cast<unsigned char>(a[ia])) != 0;
+    bool db = std::isdigit(static_cast<unsigned char>(b[ib])) != 0;
+    if (da && db) {
+      size_t sa = ia;
+      while (ia < a.size() &&
+             std::isdigit(static_cast<unsigned char>(a[ia]))) {
+        ++ia;
+      }
+      size_t sb = ib;
+      while (ib < b.size() &&
+             std::isdigit(static_cast<unsigned char>(b[ib]))) {
+        ++ib;
+      }
+      size_t nz_a = sa;
+      while (nz_a < ia && a[nz_a] == '0') ++nz_a;
+      size_t nz_b = sb;
+      while (nz_b < ib && b[nz_b] == '0') ++nz_b;
+
+      size_t len_a = ia - nz_a;
+      size_t len_b = ib - nz_b;
+      if (len_a != len_b) return len_a < len_b;
+      int cmp = a.substr(nz_a, len_a).compare(b.substr(nz_b, len_b));
+      if (cmp != 0) return cmp < 0;
+      size_t raw_len_a = ia - sa;
+      size_t raw_len_b = ib - sb;
+      if (raw_len_a != raw_len_b) return raw_len_a < raw_len_b;
+      continue;
+    }
+    unsigned char ca = static_cast<unsigned char>(a[ia]);
+    unsigned char cb = static_cast<unsigned char>(b[ib]);
+    unsigned char la = static_cast<unsigned char>(std::tolower(ca));
+    unsigned char lb = static_cast<unsigned char>(std::tolower(cb));
+    if (la != lb) return la < lb;
+    if (ca != cb) return ca < cb;
+    ++ia;
+    ++ib;
+  }
+  return (a.size() - ia) < (b.size() - ib);
+}
+
+}  // namespace detail
+
+inline bool is_untouched_template_content(std::string_view content,
+                                          std::string_view tpl_content) {
+  std::string norm_content = detail::strip_template_prelude(content);
+  if (norm_content.empty()) return true;
+  std::string norm_tpl = detail::strip_template_prelude(tpl_content);
+  return !norm_tpl.empty() && norm_content == norm_tpl;
+}
+
+inline Result<CleanSummary> clean_cph_workspace(const AppConfig &config,
+                                                bool dry_run,
+                                                bool include_unused = false) {
   CleanSummary summary;
   fs::path cph_dir = config.workspace_root / ".cph-ng";
   std::error_code ec;
@@ -2871,7 +3124,18 @@ inline Result<CleanSummary> clean_orphan_cph_bins(const AppConfig &config,
   if (ec) return std::unexpected(make_err(ErrKind::Other, ec.message()));
   std::sort(bin_files.begin(), bin_files.end());
 
+  std::string tpl_content;
+  if (include_unused && fs::is_regular_file(config.template_source, ec)) {
+    auto tpl_res = read_file_to_string(config.template_source);
+    if (!tpl_res) return std::unexpected(tpl_res.error());
+    tpl_content = std::move(*tpl_res);
+  }
+  ec.clear();
+
   fs::path norm_ws = normalize_path(config.workspace_root);
+  fs::path norm_tpl = normalize_path(config.template_source);
+  std::map<fs::path, std::vector<fs::path>> existing_src_bins;
+
   for (const auto &bin_path : bin_files) {
     auto meta_res = read_cph_bin(bin_path);
     if (!meta_res) return std::unexpected(meta_res.error());
@@ -2884,12 +3148,59 @@ inline Result<CleanSummary> clean_orphan_cph_bins(const AppConfig &config,
 
     auto src_st = fs::symlink_status(norm_src, ec);
     if (src_st.type() == fs::file_type::not_found) {
+      ec.clear();
       if (!dry_run) {
-        if (::unlink(bin_path.c_str()) != 0) {
+        if (::unlink(bin_path.c_str()) != 0 && errno != ENOENT) {
           return std::unexpected(from_errno(bin_path.string()));
         }
       }
       summary.removed_bins.push_back(bin_path);
+    } else if (include_unused && !ec &&
+               src_st.type() == fs::file_type::regular) {
+      existing_src_bins[norm_src].push_back(bin_path);
+    } else {
+      ec.clear();
+    }
+  }
+
+  if (include_unused) {
+    std::set<fs::path> touched_top_subdirs;
+    for (auto &[norm_src, bins] : existing_src_bins) {
+      if (norm_src.extension() != ".cpp") continue;
+      if (norm_src == norm_tpl) continue;
+      fs::path parent_dir = norm_src.parent_path();
+      if (is_protected_workspace_dir(config, parent_dir)) continue;
+
+      auto content_res = read_file_to_string(norm_src);
+      if (!content_res) return std::unexpected(content_res.error());
+      if (!is_untouched_template_content(*content_res, tpl_content)) continue;
+
+      if (!dry_run) {
+        if (::unlink(norm_src.c_str()) != 0 && errno != ENOENT) {
+          return std::unexpected(from_errno(norm_src.string()));
+        }
+        for (const auto &b : bins) {
+          if (::unlink(b.c_str()) != 0 && errno != ENOENT) {
+            return std::unexpected(from_errno(b.string()));
+          }
+        }
+        if (parent_dir != norm_ws && path_starts_with(parent_dir, norm_ws)) {
+          fs::path rel_parent = parent_dir.lexically_relative(norm_ws);
+          auto it_comp = rel_parent.begin();
+          if (it_comp != rel_parent.end() && !it_comp->empty() &&
+              *it_comp != ".") {
+            touched_top_subdirs.insert(norm_ws / *it_comp);
+          }
+        }
+      }
+      summary.removed_unused.push_back(
+          UnusedProblemEntry{norm_src, std::move(bins)});
+    }
+
+    if (!dry_run) {
+      for (const auto &sub : touched_top_subdirs) {
+        detail::prune_empty_subdirs(sub, true);
+      }
     }
   }
 
@@ -2897,6 +3208,11 @@ inline Result<CleanSummary> clean_orphan_cph_bins(const AppConfig &config,
     detail::prune_empty_subdirs(cph_dir, false);
   }
   return summary;
+}
+
+inline Result<CleanSummary> clean_orphan_cph_bins(const AppConfig &config,
+                                                  bool dry_run) {
+  return clean_cph_workspace(config, dry_run, false);
 }
 
 // --- Pack Contest ---
@@ -2993,28 +3309,6 @@ inline std::optional<std::string_view> find_query_param(std::string_view url,
     pos = amp + 1;
   }
   return std::nullopt;
-}
-
-inline std::string strip_template_prelude(std::string_view content) {
-  std::string_view sv = content;
-  if (sv.starts_with("\xEF\xBB\xBF")) sv.remove_prefix(3);
-
-  auto nl = sv.find('\n');
-  std::string_view first_line =
-      (nl == std::string_view::npos) ? sv : sv.substr(0, nl);
-  std::string_view trimmed_first = trim_start(first_line);
-  if (trimmed_first.starts_with("//") &&
-      (trimmed_first.find("http://") != std::string_view::npos ||
-       trimmed_first.find("https://") != std::string_view::npos)) {
-    sv = (nl == std::string_view::npos) ? std::string_view{} : sv.substr(nl + 1);
-  }
-
-  std::string clean;
-  clean.reserve(sv.size());
-  for (char c : sv) {
-    if (c != '\r') clean.push_back(c);
-  }
-  return std::string(trim(clean));
 }
 
 }  // namespace detail
@@ -3196,14 +3490,6 @@ inline std::string extract_problem_label(std::string_view name,
   return std::string(stem);
 }
 
-inline bool is_untouched_template_content(std::string_view content,
-                                          std::string_view tpl_content) {
-  std::string norm_content = detail::strip_template_prelude(content);
-  if (norm_content.empty()) return true;
-  std::string norm_tpl = detail::strip_template_prelude(tpl_content);
-  return !norm_tpl.empty() && norm_content == norm_tpl;
-}
-
 inline Result<void> relocate_cph_bin(const fs::path &old_bin,
                                      const fs::path &new_bin,
                                      const fs::path &new_src_path) {
@@ -3323,11 +3609,17 @@ inline Result<std::vector<ContestGroupSummary>> list_root_contests(
     (void)k;
     std::sort(g.items.begin(), g.items.end(),
               [](const ContestProblemItem &a, const ContestProblemItem &b) {
-                if (a.label != b.label) return a.label < b.label;
+                if (a.label != b.label) {
+                  return detail::natural_less(a.label, b.label);
+                }
                 return a.src_path < b.src_path;
               });
     out.push_back(std::move(g));
   }
+  std::sort(out.begin(), out.end(),
+            [](const ContestGroupSummary &a, const ContestGroupSummary &b) {
+              return detail::natural_less(a.info.key, b.info.key);
+            });
   return out;
 }
 
@@ -3344,18 +3636,9 @@ inline Result<PackSummary> pack_contest(
                          : (config.workspace_root / contest_dir_arg);
   fs::path dst_dir = normalize_path(raw_dst);
   fs::path norm_ws = normalize_path(config.workspace_root);
-  fs::path norm_cat = normalize_path(config.catalog_root);
-  fs::path norm_rec = normalize_path(config.record_root);
-  fs::path norm_lib = normalize_path(config.library_root);
-  fs::path norm_cph = normalize_path(config.workspace_root / ".cph-ng");
-  fs::path norm_yrs = normalize_path(config.workspace_root / "YRS");
 
   if (!path_starts_with(dst_dir, norm_ws) || dst_dir == norm_ws ||
-      path_starts_with(dst_dir, norm_cat) ||
-      path_starts_with(dst_dir, norm_rec) ||
-      path_starts_with(dst_dir, norm_cph) ||
-      path_starts_with(dst_dir, norm_yrs) ||
-      (norm_lib != norm_ws && path_starts_with(dst_dir, norm_lib))) {
+      is_protected_workspace_dir(config, dst_dir)) {
     return std::unexpected(
         make_err(ErrKind::InvalidInput,
                  "contest directory must be a non-protected subdirectory under "
@@ -3505,6 +3788,694 @@ inline Result<PackSummary> pack_contest(
   }
 
   return summary;
+}
+
+// --- Workspace Status Dashboard ---
+
+enum class ProblemStateKind {
+  Ac,
+  Failed,
+  Partial,
+  Unrun,
+  NoTests,
+  Untouched,
+  LocalNoCph,
+};
+
+struct StatusProblemItem {
+  fs::path src_path;
+  std::optional<fs::path> stage_dst;
+  std::string label;
+  ProblemStateKind state = ProblemStateKind::LocalNoCph;
+  size_t enabled_tc = 0;
+  size_t ac_tc = 0;
+  std::string verdict_tag;
+  bool unrouted_ac = false;
+};
+
+struct StatusContestGroup {
+  ContestInfo info;
+  std::vector<StatusProblemItem> items;
+  size_t ac_count = 0;
+  size_t wip_count = 0;
+  size_t untouched_count = 0;
+};
+
+struct StatusSubdirGroup {
+  fs::path dir_path;
+  std::string rel_name;
+  std::vector<StatusProblemItem> items;
+  size_t ac_count = 0;
+  size_t wip_count = 0;
+  size_t untouched_count = 0;
+  size_t local_count = 0;
+};
+
+struct CatalogBucketCount {
+  std::string name;
+  size_t count = 0;
+};
+
+struct WorkspaceStatus {
+  fs::path workspace_root;
+  fs::path cwd;
+  std::optional<fs::path> latest_active_cpp;
+  std::vector<StatusProblemItem> ready_to_stage;
+  std::vector<StatusContestGroup> root_contests;
+  std::vector<StatusSubdirGroup> subdir_workspaces;
+  std::vector<StatusProblemItem> in_progress_singles;
+  std::vector<StatusProblemItem> untouched_singles;
+  std::vector<fs::path> local_root_files;
+  size_t catalog_file_count = 0;
+  std::vector<CatalogBucketCount> catalog_buckets;
+  size_t orphan_bin_count = 0;
+  size_t total_unused_cph_count = 0;
+};
+
+namespace detail {
+
+inline std::string rel_display(const fs::path &norm_base, const fs::path &p) {
+  fs::path norm_p = normalize_path(p);
+  if (norm_p == norm_base) return ".";
+  if (path_starts_with(norm_p, norm_base)) {
+    fs::path rel = norm_p.lexically_relative(norm_base);
+    if (!rel.empty()) return rel.string();
+  }
+  return p.string();
+}
+
+inline StatusProblemItem build_status_item_from_meta(const fs::path &src_path,
+                                                     const ProblemMeta &meta,
+                                                     bool untouched) {
+  StatusProblemItem item;
+  item.src_path = src_path;
+  item.enabled_tc = meta.enabled_tc;
+  item.ac_tc = meta.ac_tc;
+
+  if (untouched) {
+    item.state = ProblemStateKind::Untouched;
+    item.verdict_tag = "untouched";
+    return item;
+  }
+
+  std::string ratio =
+      std::to_string(meta.ac_tc) + "/" + std::to_string(meta.enabled_tc);
+  if (meta.enabled_tc == 0) {
+    item.state = ProblemStateKind::NoTests;
+    item.verdict_tag = "no tests";
+  } else if (meta.all_ac) {
+    item.state = ProblemStateKind::Ac;
+    item.verdict_tag = "AC " + ratio;
+  } else if (meta.failed_tc > 0) {
+    item.state = ProblemStateKind::Failed;
+    std::string v =
+        meta.first_fail_verdict.empty() ? "FAIL" : meta.first_fail_verdict;
+    item.verdict_tag = v + " " + ratio;
+  } else if (meta.ac_tc > 0) {
+    item.state = ProblemStateKind::Partial;
+    item.verdict_tag = "partial " + ratio;
+  } else {
+    item.state = ProblemStateKind::Unrun;
+    item.verdict_tag = "unrun " + ratio;
+  }
+  return item;
+}
+
+inline Result<void> collect_active_subdir_cpps_rec(
+    const fs::path &cur_dir, const AppConfig &config, const fs::path &norm_tpl,
+    std::vector<fs::path> &out) {
+  std::error_code ec;
+  fs::directory_iterator it(cur_dir, ec);
+  if (ec) return std::unexpected(make_err(ErrKind::Other, ec.message()));
+
+  for (const auto &entry : it) {
+    auto st = entry.symlink_status(ec);
+    if (ec) continue;
+    const fs::path &p = entry.path();
+    if (st.type() == fs::file_type::directory) {
+      if (!is_protected_workspace_dir(config, p)) {
+        auto sub = collect_active_subdir_cpps_rec(p, config, norm_tpl, out);
+        if (!sub) return sub;
+      }
+      continue;
+    }
+    if (st.type() == fs::file_type::regular && p.extension() == ".cpp") {
+      if (normalize_path(p) != norm_tpl) {
+        out.push_back(p);
+      }
+    }
+  }
+  return {};
+}
+
+inline Result<void> collect_catalog_files_rec(
+    const fs::path &cur_dir, const fs::path &norm_cat,
+    const fs::path &norm_summary, size_t &total_files,
+    std::map<std::string, size_t> &buckets) {
+  std::error_code ec;
+  fs::directory_iterator it(cur_dir, ec);
+  if (ec) return std::unexpected(make_err(ErrKind::Other, ec.message()));
+
+  for (const auto &entry : it) {
+    auto st = entry.symlink_status(ec);
+    if (ec) return std::unexpected(make_err(ErrKind::Other, ec.message()));
+    const fs::path &p = entry.path();
+    if (st.type() == fs::file_type::directory) {
+      auto sub = collect_catalog_files_rec(p, norm_cat, norm_summary,
+                                           total_files, buckets);
+      if (!sub) return sub;
+      continue;
+    }
+    if (st.type() != fs::file_type::regular) continue;
+    fs::path norm_p = normalize_path(p);
+    if (norm_p == norm_summary) continue;
+
+    ++total_files;
+    fs::path rel = norm_p.lexically_relative(norm_cat);
+    std::vector<std::string> parts;
+    for (const auto &c : rel) {
+      if (!c.empty() && c != ".") parts.push_back(c.string());
+    }
+    std::string bucket = (parts.size() >= 2) ? parts[0] : "(root)";
+    ++buckets[bucket];
+  }
+  return {};
+}
+
+}  // namespace detail
+
+inline Result<WorkspaceStatus> inspect_workspace_status(
+    const AppConfig &config, const fs::path &cwd = {}) {
+  WorkspaceStatus status;
+  status.workspace_root = config.workspace_root;
+  status.cwd = cwd.empty() ? config.workspace_root : cwd;
+
+  auto latest_res = find_latest_active_cpp(config, status.cwd);
+  if (latest_res) {
+    status.latest_active_cpp = *latest_res;
+  } else if (latest_res.error().kind != ErrKind::InvalidInput) {
+    return std::unexpected(latest_res.error());
+  }
+
+  fs::path norm_ws = normalize_path(config.workspace_root);
+  fs::path norm_tpl = normalize_path(config.template_source);
+  fs::path norm_summary = normalize_path(config.summary_path);
+
+  // Scan .cph-ng/**/*.bin once for both metadata index and orphan count
+  std::map<fs::path, ProblemMeta> index;
+  {
+    fs::path cph_dir = config.workspace_root / ".cph-ng";
+    std::error_code ec;
+    if (fs::is_directory(cph_dir, ec)) {
+      std::vector<fs::path> bin_files;
+      for (fs::recursive_directory_iterator it(cph_dir, ec), end;
+           !ec && it != end; it.increment(ec)) {
+        auto st = it->symlink_status(ec);
+        if (ec) return std::unexpected(make_err(ErrKind::Other, ec.message()));
+        if (st.type() == fs::file_type::regular &&
+            it->path().extension() == ".bin") {
+          bin_files.push_back(it->path());
+        }
+      }
+      if (ec) return std::unexpected(make_err(ErrKind::Other, ec.message()));
+      std::sort(bin_files.begin(), bin_files.end());
+
+      for (const auto &bin_path : bin_files) {
+        auto meta_res = read_cph_bin(bin_path);
+        if (!meta_res) return std::unexpected(meta_res.error());
+        fs::path abs_src = meta_res->src_path.is_absolute()
+                               ? meta_res->src_path
+                               : (config.workspace_root / meta_res->src_path);
+        fs::path norm_src = normalize_path(abs_src);
+        if (path_starts_with(norm_src, norm_ws)) {
+          auto src_st = fs::symlink_status(norm_src, ec);
+          if (src_st.type() == fs::file_type::not_found) {
+            ec.clear();
+            ++status.orphan_bin_count;
+            continue;
+          }
+          ec.clear();
+        }
+        index.insert_or_assign(std::move(norm_src), std::move(*meta_res));
+      }
+    }
+  }
+
+  std::string tpl_content;
+  {
+    std::error_code ec;
+    if (fs::is_regular_file(config.template_source, ec)) {
+      auto tpl_res = read_file_to_string(config.template_source);
+      if (!tpl_res) return std::unexpected(tpl_res.error());
+      tpl_content = std::move(*tpl_res);
+    }
+  }
+
+  std::error_code ec;
+  fs::directory_iterator ws_it(config.workspace_root, ec);
+  if (ec) return std::unexpected(make_err(ErrKind::Other, ec.message()));
+
+  std::vector<fs::path> root_cpps;
+  std::vector<fs::path> active_subdirs;
+  for (const auto &entry : ws_it) {
+    auto st = entry.symlink_status(ec);
+    if (ec) continue;
+    const fs::path &p = entry.path();
+    if (st.type() == fs::file_type::directory) {
+      if (!is_protected_workspace_dir(config, p)) {
+        active_subdirs.push_back(p);
+      }
+    } else if (st.type() == fs::file_type::regular &&
+               p.extension() == ".cpp") {
+      root_cpps.push_back(p);
+    }
+  }
+
+  std::map<std::string, StatusContestGroup> contest_map;
+  for (const auto &src_path : root_cpps) {
+    fs::path norm_src = normalize_path(src_path);
+    if (norm_src == norm_tpl) continue;
+
+    auto mit = index.find(norm_src);
+    if (mit == index.end()) {
+      status.local_root_files.push_back(src_path);
+      continue;
+    }
+
+    const ProblemMeta &meta = mit->second;
+    auto content_res = read_file_to_string(src_path);
+    if (!content_res) return std::unexpected(content_res.error());
+    bool untouched = is_untouched_template_content(*content_res, tpl_content);
+    if (untouched) ++status.total_unused_cph_count;
+
+    std::optional<ContestInfo> cinfo;
+    if (meta.url && !meta.url->empty()) {
+      cinfo = extract_contest_info(*meta.url);
+    }
+
+    if (cinfo) {
+      StatusProblemItem item =
+          detail::build_status_item_from_meta(src_path, meta, untouched);
+      item.label = extract_problem_label(meta.name, *meta.url,
+                                         src_path.stem().string());
+      auto &grp = contest_map[cinfo->key];
+      if (grp.info.key.empty()) grp.info = *cinfo;
+      if (untouched) ++grp.untouched_count;
+      else if (meta.all_ac) ++grp.ac_count;
+      else ++grp.wip_count;
+      grp.items.push_back(std::move(item));
+      continue;
+    }
+
+    std::optional<fs::path> stage_dst;
+    if (meta.all_ac && meta.url && !meta.url->empty()) {
+      stage_dst = route_single_problem(
+          config.catalog_root, src_path.filename().string(), meta.name,
+          *meta.url);
+    }
+
+    if (stage_dst) {
+      StatusProblemItem item =
+          detail::build_status_item_from_meta(src_path, meta, false);
+      item.stage_dst = std::move(stage_dst);
+      status.ready_to_stage.push_back(std::move(item));
+    } else if (untouched) {
+      StatusProblemItem item =
+          detail::build_status_item_from_meta(src_path, meta, true);
+      status.untouched_singles.push_back(std::move(item));
+    } else {
+      StatusProblemItem item =
+          detail::build_status_item_from_meta(src_path, meta, false);
+      if (meta.all_ac) {
+        item.unrouted_ac = true;
+        item.verdict_tag.append(", manual");
+      }
+      status.in_progress_singles.push_back(std::move(item));
+    }
+  }
+
+  auto by_src_name = [](const StatusProblemItem &a,
+                        const StatusProblemItem &b) {
+    std::string na = a.src_path.filename().string();
+    std::string nb = b.src_path.filename().string();
+    if (na != nb) return detail::natural_less(na, nb);
+    return a.src_path < b.src_path;
+  };
+  std::sort(status.ready_to_stage.begin(), status.ready_to_stage.end(),
+            by_src_name);
+  std::sort(status.in_progress_singles.begin(),
+            status.in_progress_singles.end(), by_src_name);
+  std::sort(status.untouched_singles.begin(), status.untouched_singles.end(),
+            by_src_name);
+  std::sort(status.local_root_files.begin(), status.local_root_files.end(),
+            [](const fs::path &a, const fs::path &b) {
+              std::string na = a.filename().string();
+              std::string nb = b.filename().string();
+              if (na != nb) return detail::natural_less(na, nb);
+              return a < b;
+            });
+
+  status.root_contests.reserve(contest_map.size());
+  for (auto &[k, grp] : contest_map) {
+    (void)k;
+    std::sort(grp.items.begin(), grp.items.end(),
+              [](const StatusProblemItem &a, const StatusProblemItem &b) {
+                if (a.label != b.label) {
+                  return detail::natural_less(a.label, b.label);
+                }
+                return a.src_path < b.src_path;
+              });
+    status.root_contests.push_back(std::move(grp));
+  }
+  std::sort(status.root_contests.begin(), status.root_contests.end(),
+            [](const StatusContestGroup &a, const StatusContestGroup &b) {
+              return detail::natural_less(a.info.key, b.info.key);
+            });
+
+  for (const auto &sub_dir : active_subdirs) {
+    std::vector<fs::path> sub_cpps;
+    auto col_res = detail::collect_active_subdir_cpps_rec(sub_dir, config,
+                                                          norm_tpl, sub_cpps);
+    if (!col_res) return std::unexpected(col_res.error());
+    if (sub_cpps.empty()) continue;
+
+    fs::path norm_sub = normalize_path(sub_dir);
+    StatusSubdirGroup grp;
+    grp.dir_path = sub_dir;
+    grp.rel_name = detail::rel_display(norm_ws, sub_dir);
+
+    for (const auto &p : sub_cpps) {
+      fs::path norm_p = normalize_path(p);
+      std::string rel_in_sub = detail::rel_display(norm_sub, p);
+      auto mit = index.find(norm_p);
+      if (mit == index.end()) {
+        StatusProblemItem item;
+        item.src_path = p;
+        item.label = std::move(rel_in_sub);
+        item.state = ProblemStateKind::LocalNoCph;
+        item.verdict_tag = "local";
+        ++grp.local_count;
+        grp.items.push_back(std::move(item));
+        continue;
+      }
+
+      const ProblemMeta &meta = mit->second;
+      auto content_res = read_file_to_string(p);
+      if (!content_res) return std::unexpected(content_res.error());
+      bool untouched = is_untouched_template_content(*content_res, tpl_content);
+      if (untouched) {
+        ++status.total_unused_cph_count;
+        ++grp.untouched_count;
+      } else if (meta.all_ac) {
+        ++grp.ac_count;
+      } else {
+        ++grp.wip_count;
+      }
+
+      StatusProblemItem item =
+          detail::build_status_item_from_meta(p, meta, untouched);
+      item.label = std::move(rel_in_sub);
+      grp.items.push_back(std::move(item));
+    }
+
+    std::sort(grp.items.begin(), grp.items.end(),
+              [](const StatusProblemItem &a, const StatusProblemItem &b) {
+                if (a.label != b.label) {
+                  return detail::natural_less(a.label, b.label);
+                }
+                return a.src_path < b.src_path;
+              });
+    status.subdir_workspaces.push_back(std::move(grp));
+  }
+  std::sort(status.subdir_workspaces.begin(), status.subdir_workspaces.end(),
+            [](const StatusSubdirGroup &a, const StatusSubdirGroup &b) {
+              return detail::natural_less(a.rel_name, b.rel_name);
+            });
+
+  if (fs::is_directory(config.catalog_root, ec)) {
+    fs::path norm_cat = normalize_path(config.catalog_root);
+    std::map<std::string, size_t> buckets;
+    auto cat_res = detail::collect_catalog_files_rec(
+        config.catalog_root, norm_cat, norm_summary, status.catalog_file_count,
+        buckets);
+    if (!cat_res) return std::unexpected(cat_res.error());
+    status.catalog_buckets.reserve(buckets.size());
+    for (auto &[name, cnt] : buckets) {
+      status.catalog_buckets.push_back(CatalogBucketCount{name, cnt});
+    }
+    std::sort(status.catalog_buckets.begin(), status.catalog_buckets.end(),
+              [](const CatalogBucketCount &a, const CatalogBucketCount &b) {
+                return detail::natural_less(a.name, b.name);
+              });
+  }
+
+  return status;
+}
+
+inline std::string render_workspace_status(const WorkspaceStatus &st,
+                                           bool verbose) {
+  static constexpr std::string_view C_GREEN = "\x1b[32m";
+  static constexpr std::string_view C_RED = "\x1b[31m";
+  static constexpr std::string_view C_YELLOW = "\x1b[33m";
+  static constexpr std::string_view C_DIM = "\x1b[90m";
+  static constexpr std::string_view C_RESET = "\x1b[0m";
+
+  auto color_for = [&](ProblemStateKind k) -> std::string_view {
+    switch (k) {
+      case ProblemStateKind::Ac: return C_GREEN;
+      case ProblemStateKind::Failed: return C_RED;
+      case ProblemStateKind::Partial:
+      case ProblemStateKind::Unrun:
+      case ProblemStateKind::NoTests: return C_YELLOW;
+      case ProblemStateKind::Untouched:
+      case ProblemStateKind::LocalNoCph: return C_DIM;
+    }
+    return C_RESET;
+  };
+
+  auto format_badge = [&](const StatusProblemItem &item) -> std::string {
+    std::string s;
+    std::string_view col = color_for(item.state);
+    s.append(col)
+        .push_back('[');
+    s.append(item.verdict_tag)
+        .push_back(']');
+    s.append(C_RESET);
+    return s;
+  };
+
+  auto append_header_row = [](std::string &out, std::string_view label,
+                              std::string_view val) {
+    constexpr size_t W = 15;
+    size_t len = label.size();
+    size_t pad = (len < W) ? (W - len) : 0;
+    size_t left = pad / 2;
+    size_t right = pad - left;
+    out.append(left, ' ');
+    out.append(label);
+    out.append(right, ' ');
+    out.push_back(' ');
+    out.append(val);
+    out.push_back('\n');
+  };
+
+  fs::path norm_ws = normalize_path(st.workspace_root);
+  fs::path norm_cwd = normalize_path(st.cwd);
+
+  std::string out;
+  append_header_row(out, "workspace root", st.workspace_root.string());
+  if (norm_cwd != norm_ws) {
+    append_header_row(out, "cwd", detail::rel_display(norm_ws, st.cwd));
+  }
+  if (st.latest_active_cpp) {
+    append_header_row(out, "latest cpp",
+                      detail::rel_display(norm_ws, *st.latest_active_cpp));
+  } else {
+    append_header_row(out, "latest cpp", "(none)");
+  }
+
+  bool any_section = false;
+  auto begin_section = [&](std::string_view title) {
+    out.push_back('\n');
+    out.append(title).push_back('\n');
+    any_section = true;
+  };
+
+  if (!st.ready_to_stage.empty()) {
+    begin_section("Ready to stage (" +
+                  std::to_string(st.ready_to_stage.size()) + "):");
+    for (const auto &item : st.ready_to_stage) {
+      out.append("  ")
+          .append(item.src_path.filename().string())
+          .append(" -> ")
+          .append(detail::rel_display(norm_ws, *item.stage_dst))
+          .append("  ")
+          .append(format_badge(item))
+          .push_back('\n');
+    }
+  }
+
+  if (!st.root_contests.empty()) {
+    begin_section("Root contests (" +
+                  std::to_string(st.root_contests.size()) + "):");
+    for (const auto &grp : st.root_contests) {
+      size_t mod_cnt = grp.ac_count + grp.wip_count;
+      out.append("  ")
+          .append(grp.info.key)
+          .append("  (")
+          .append(std::to_string(mod_cnt))
+          .append(" modified: ")
+          .append(std::to_string(grp.ac_count))
+          .append(" AC, ")
+          .append(std::to_string(grp.wip_count))
+          .append(" WIP; ")
+          .append(std::to_string(grp.untouched_count))
+          .append(" untouched)\n");
+      for (const auto &item : grp.items) {
+        if (item.state == ProblemStateKind::Untouched && !verbose) continue;
+        out.append("    ")
+            .append(item.src_path.filename().string())
+            .append(" -> ")
+            .append(item.label)
+            .append(".cpp  ")
+            .append(format_badge(item))
+            .push_back('\n');
+      }
+      if (!verbose && grp.untouched_count > 0) {
+        out.append("    ")
+            .append(C_DIM)
+            .append("+ ")
+            .append(std::to_string(grp.untouched_count))
+            .append(" untouched template(s) (use -v to list)")
+            .append(C_RESET)
+            .push_back('\n');
+      }
+    }
+  }
+
+  if (!st.subdir_workspaces.empty()) {
+    begin_section("Subdir workspaces (" +
+                  std::to_string(st.subdir_workspaces.size()) + "):");
+    for (const auto &grp : st.subdir_workspaces) {
+      out.append("  ")
+          .append(grp.rel_name)
+          .append("/  (")
+          .append(std::to_string(grp.items.size()))
+          .append(grp.items.size() == 1 ? " file: " : " files: ")
+          .append(std::to_string(grp.ac_count))
+          .append(" AC, ")
+          .append(std::to_string(grp.wip_count))
+          .append(" WIP");
+      if (grp.untouched_count > 0) {
+        out.append(", ")
+            .append(std::to_string(grp.untouched_count))
+            .append(" untouched");
+      }
+      if (grp.local_count > 0) {
+        out.append(", ")
+            .append(std::to_string(grp.local_count))
+            .append(" local");
+      }
+      out.append(")\n");
+
+      if (verbose) {
+        for (const auto &item : grp.items) {
+          out.append("    ")
+              .append(item.label)
+              .append("  ")
+              .append(format_badge(item))
+              .push_back('\n');
+        }
+      } else {
+        out.append("    ");
+        for (size_t i = 0; i < grp.items.size(); ++i) {
+          if (i > 0) out.append(" | ");
+          out.append(grp.items[i].label)
+              .push_back(' ');
+          out.append(format_badge(grp.items[i]));
+        }
+        out.push_back('\n');
+      }
+    }
+  }
+
+  if (!st.in_progress_singles.empty()) {
+    begin_section("In progress (" +
+                  std::to_string(st.in_progress_singles.size()) + "):");
+    for (const auto &item : st.in_progress_singles) {
+      out.append("  ")
+          .append(item.src_path.filename().string())
+          .append("  ")
+          .append(format_badge(item))
+          .push_back('\n');
+    }
+  }
+
+  if (!st.untouched_singles.empty()) {
+    begin_section("Untouched templates (" +
+                  std::to_string(st.untouched_singles.size()) + "):");
+    out.append("  ");
+    for (size_t i = 0; i < st.untouched_singles.size(); ++i) {
+      if (i > 0) out.append(", ");
+      out.append(st.untouched_singles[i].src_path.filename().string());
+    }
+    out.push_back('\n');
+  }
+
+  if (!st.local_root_files.empty()) {
+    out.push_back('\n');
+    any_section = true;
+    out.append("Local files (no CPH): ");
+    for (size_t i = 0; i < st.local_root_files.size(); ++i) {
+      if (i > 0) out.append(", ");
+      out.append(st.local_root_files[i].filename().string());
+    }
+    out.push_back('\n');
+  }
+
+  if (st.catalog_file_count > 0) {
+    out.push_back('\n');
+    any_section = true;
+    out.append("Catalog (.wait): ")
+        .append(std::to_string(st.catalog_file_count))
+        .append(" file(s)");
+    if (!st.catalog_buckets.empty()) {
+      out.append(" (");
+      for (size_t i = 0; i < st.catalog_buckets.size(); ++i) {
+        if (i > 0) out.append(", ");
+        out.append(st.catalog_buckets[i].name)
+            .append(": ")
+            .append(std::to_string(st.catalog_buckets[i].count));
+      }
+      out.push_back(')');
+    }
+    out.append(" -> ready for `move`\n");
+  }
+
+  if (st.total_unused_cph_count > 0 || st.orphan_bin_count > 0) {
+    out.push_back('\n');
+    any_section = true;
+    out.append("Hygiene: ");
+    bool first = true;
+    if (st.total_unused_cph_count > 0) {
+      out.append(std::to_string(st.total_unused_cph_count))
+          .append(" unused CPH template(s) (`clean -u`)");
+      first = false;
+    }
+    if (st.orphan_bin_count > 0) {
+      if (!first) out.append(", ");
+      out.append(std::to_string(st.orphan_bin_count))
+          .append(" orphan .bin (`clean`)");
+    }
+    out.push_back('\n');
+  }
+
+  if (!any_section) {
+    out.append("\nworkspace is clean\n");
+  }
+
+  if (!out.empty() && out.back() == '\n') out.pop_back();
+  return out;
 }
 
 }  // namespace cph

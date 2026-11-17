@@ -6,17 +6,20 @@
 
 ## 功能概览
 
-- `bundle [<FILE>]`: 查找当前工作区里最新修改的 `.cpp` 文件 (或显式传入 `<FILE>`), 递归展开 `library_root` 下的本地 `#include "..."`, 剥离行尾注释与 `#pragma once` 后复制到剪贴板
-- `check`: 读取当前目录下的 `yrs.toml`, 打印工作区和各个关键路径配置
-- `cover-latest`: 用模板文件覆盖当前工作区里最新修改的 `.cpp` 文件
+所有子命令均支持从当前目录向上递归查找 `yrs.toml` 定位工作区根目录, 在比赛子目录内也能直接调用
+
+- `bundle [<FILE>]`: 查找活跃工作区里最新修改的 `.cpp` 文件 (若在活跃子目录内执行则限定于该子目录, 自动排除模板源 `template_source`; 也可显式传入 `<FILE>`), 递归展开 `library_root` 下的本地 `#include "..."`, 剥离行尾注释与 `#pragma once` 后复制到剪贴板
+- `check`: 向上查找并读取 `yrs.toml`, 打印当前目录, 工作区根路径和各个关键路径配置
+- `cover-latest [-n|--dry-run]`: 用模板文件覆盖活跃工作区里最新修改的 `.cpp` 文件 (作用域规则与无参 `bundle` 一致, 支持 `-n` 预览目标路径)
+- `status [-v|--verbose]`: 一屏展示全局工作区看板, 包含当前最新活跃 `.cpp`, 可直接 `stage` 的全 `AC` 单题, 根目录套题与子目录比赛进度 (默认折叠未动模板计数, `-v` 展开详情), 编写中单题, 未修改空模板, 本地无 `.bin` 辅助文件及 `.wait` 待归档队列
 - `pack`: 扫描工作区根目录按比赛聚合的 `.cpp` 文件与 `.cph-ng/*.bin` 元数据 (支持 `qoj`, `cf`, `gym`, `atcoder`, `uoj`, `nowcoder`, `luogu` 比赛), 列出根目录比赛或将指定比赛一键收拢至 `<CONTEST_DIR>/`:
   - 列出比赛: `yrs-cli pack`
-  - 收拢比赛: `yrs-cli pack [-n|--dry-run] [<CONTEST_ID>] <CONTEST_DIR>` (根目录仅有一场比赛时可省略 `<CONTEST_ID>`; 写过代码的题自动注入首行 `// <url>`, 保留 `mtime`, 按题号重命名为 `A.cpp, B.cpp...` 并同步迁移重写 `.cph-ng/*.bin` 保留测试样例; 未动过的纯模板空题连同 `.bin` 自动清理)
+  - 收拢比赛: `yrs-cli pack [-n|--dry-run] [<CONTEST_ID>] <CONTEST_DIR>` (根目录仅有一场比赛时可省略 `<CONTEST_ID>`; 写过代码的题自动注入首行 `// <url>`, 保留 `mtime`, 按自然题号序重命名为 `A.cpp, B.cpp...` 并同步迁移重写 `.cph-ng/*.bin` 保留测试样例; 未动过的纯模板空题连同 `.bin` 自动清理)
 - `stage`: 联动 `.cph-ng/*.bin` 元数据, 将已完成代码移入 `catalog_root`:
   - 单题自动分拣: `yrs-cli stage [-n|--dry-run]` (筛选全部启用测试点均为 `AC` 的单题 `.cpp`, 注入首行 `// <url>`, 保留原修改时间后分拣至 `luogu/`, `luogu/B/`, `library_checker/`, `loj/`, `uoj/`, `yukicoder/XXXX-YYYY/` 并清理 `.bin`; 自动跳过 QOJ / Codeforces / AtCoder 单题)
-  - 比赛目录归档: `yrs-cli stage [-n|--dry-run] <SRC_DIR> <WAIT_SUBDIR>` (将整场比赛目录移入 `catalog_root/<WAIT_SUBDIR>`, 补齐首行 `// <url>` 并清理对应 `.bin` 与空目录)
+  - 比赛目录归档: `yrs-cli stage [-n|--dry-run] <SRC_DIR> <WAIT_SUBDIR>` (将整场比赛目录移入 `catalog_root/<WAIT_SUBDIR>`, 补齐首行 `// <url>` 并清理对应 `.bin` 与空目录; 在比赛子目录内可直接传 `.` 作为 `<SRC_DIR>`)
 - `move`: 把 `catalog_root` 中的文件移动到 `record_root`, 按 `UTC+8` 修改日期分组渲染目录树并更新 `summary_file`, 完成后自动清理孤儿 `.cph-ng/**/*.bin`
-- `clean [-n|--dry-run]`: 清理工作区下源文件已移走或删除的孤儿 `.cph-ng/**/*.bin` 缓存文件
+- `clean [-n|--dry-run] [-u|--unused]`: 清理工作区下源文件已移走或删除的孤儿 `.cph-ng/**/*.bin` 缓存文件; 附加 `-u` / `--unused` 时一并清理活跃工作区内所有关联 `.cph-ng/**/*.bin` 且未修改的纯模板 `.cpp` 及其 `.bin` (自建无 `.bin` 辅助文件与 `template_source` 不会受影响)
 
 ## `cph-ng` 协同工作流
 
@@ -41,7 +44,7 @@
 ## 编译与安装
 
 ```bash
-make          # 编译 yrs-cli (约 155KB)
+make          # 编译 yrs-cli (约 210KB)
 make test     # 运行 ASan + UBSan 单元与集成测试
 make install  # 安装到 $(INSTALL_DIR)/yrs-cli (默认 ~/.cargo/bin/yrs-cli)
 make clean    # 清理编译与测试产物
