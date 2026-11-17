@@ -1,4 +1,5 @@
 /yrs-cli
+/build/
 /*.o
 /.vscode
 .codex

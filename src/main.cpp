@@ -1,12 +1,22 @@
 #include "yrs.hpp"
 
+#include <array>
 #include <csignal>
 #include <cstdio>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
 
 namespace {
 
-constexpr const char *ANSI_RED = "\x1b[31m";
-constexpr const char *ANSI_RESET = "\x1b[0m";
+void print_red_err_prefix(std::string_view label) {
+  std::fprintf(stderr, "%.*s%.*s%.*s",
+               static_cast<int>(yrs::term::RED.size()), yrs::term::RED.data(),
+               static_cast<int>(label.size()), label.data(),
+               static_cast<int>(yrs::term::RESET.size()),
+               yrs::term::RESET.data());
+}
 
 void print_help(const char *prog) {
   std::printf(
@@ -40,52 +50,56 @@ void print_help(const char *prog) {
 }
 
 std::string ws_rel_str(const yrs::AppConfig &cfg, const yrs::fs::path &p) {
-  return yrs::cph::detail::rel_display(
-      yrs::normalize_path(cfg.workspace_root), p);
+  return yrs::rel_display(yrs::normalize_path(cfg.workspace_root), p);
 }
 
-void print_check_row(std::string_view label, const std::string &val) {
-  constexpr size_t W = 15;
-  size_t len = label.size();
-  size_t pad = (len < W) ? (W - len) : 0;
-  size_t left = pad / 2;
-  size_t right = pad - left;
-  std::printf("%*s%.*s%*s %s\n", static_cast<int>(left), "",
-              static_cast<int>(len), label.data(), static_cast<int>(right), "",
-              val.c_str());
-}
+struct CliContext {
+  bool dry_run = false;
+  bool include_unused = false;
+  bool verbose = false;
+  std::vector<std::string_view> pos_args;
+};
 
-yrs::Result<void> run_check() {
+struct CommandContext {
+  yrs::fs::path cwd;
+  yrs::AppConfig cfg;
+};
+
+yrs::Result<CommandContext> load_command_context() {
   std::error_code ec;
   auto cwd = yrs::fs::current_path(ec);
-  if (ec) return std::unexpected(yrs::make_err(yrs::ErrKind::Other, ec.message()));
-
+  if (ec) {
+    return std::unexpected(yrs::make_err(yrs::ErrKind::Other, ec.message()));
+  }
   auto cfg_res = yrs::AppConfig::discover_for_dir(cwd);
   if (!cfg_res) return std::unexpected(cfg_res.error());
-  const auto &cfg = *cfg_res;
+  return CommandContext{std::move(cwd), std::move(*cfg_res)};
+}
 
-  print_check_row("cwd", cwd.string());
-  print_check_row("workspace root", cfg.workspace_root.string());
-  print_check_row("library root", cfg.library_root.string());
-  print_check_row("catalog root", cfg.catalog_root.string());
-  print_check_row("record root", cfg.record_root.string());
-  print_check_row("summary file", cfg.summary_path.string());
-  print_check_row("template src", cfg.template_source.string());
+yrs::Result<void> run_check(const CliContext &) {
+  auto ctx_res = load_command_context();
+  if (!ctx_res) return std::unexpected(ctx_res.error());
+  const auto &cfg = ctx_res->cfg;
+
+  yrs::term::print_kv_row("cwd", ctx_res->cwd.string());
+  yrs::term::print_kv_row("workspace root", cfg.workspace_root.string());
+  yrs::term::print_kv_row("library root", cfg.library_root.string());
+  yrs::term::print_kv_row("catalog root", cfg.catalog_root.string());
+  yrs::term::print_kv_row("record root", cfg.record_root.string());
+  yrs::term::print_kv_row("summary file", cfg.summary_path.string());
+  yrs::term::print_kv_row("template src", cfg.template_source.string());
   return {};
 }
 
-yrs::Result<void> run_cover_latest(bool dry_run) {
-  std::error_code ec;
-  auto cwd = yrs::fs::current_path(ec);
-  if (ec) return std::unexpected(yrs::make_err(yrs::ErrKind::Other, ec.message()));
+yrs::Result<void> run_cover_latest(const CliContext &cli) {
+  auto ctx_res = load_command_context();
+  if (!ctx_res) return std::unexpected(ctx_res.error());
 
-  auto cfg_res = yrs::AppConfig::discover_for_dir(cwd);
-  if (!cfg_res) return std::unexpected(cfg_res.error());
-
-  auto target_res = yrs::cover_latest_cpp(*cfg_res, cwd, dry_run);
+  auto target_res =
+      yrs::cover_latest_cpp(ctx_res->cfg, ctx_res->cwd, cli.dry_run);
   if (!target_res) return std::unexpected(target_res.error());
 
-  if (dry_run) {
+  if (cli.dry_run) {
     std::printf("[dry-run] would cover %s\n", target_res->c_str());
   } else {
     std::printf("covered %s\n", target_res->c_str());
@@ -93,26 +107,26 @@ yrs::Result<void> run_cover_latest(bool dry_run) {
   return {};
 }
 
-yrs::Result<void> run_bundle(std::optional<std::string_view> file_arg) {
-  std::error_code ec;
-  auto cwd = yrs::fs::current_path(ec);
-  if (ec) return std::unexpected(yrs::make_err(yrs::ErrKind::Other, ec.message()));
+yrs::Result<void> run_bundle(const CliContext &cli) {
+  auto ctx_res = load_command_context();
+  if (!ctx_res) return std::unexpected(ctx_res.error());
 
-  auto cfg_res = yrs::AppConfig::discover_for_dir(cwd);
-  if (!cfg_res) return std::unexpected(cfg_res.error());
+  std::optional<std::string_view> file_arg;
+  if (!cli.pos_args.empty()) file_arg = cli.pos_args[0];
 
   yrs::Result<yrs::BundledLatest> bundled_res =
       file_arg
           ? [&]() -> yrs::Result<yrs::BundledLatest> {
+              std::error_code ec;
               yrs::fs::path p(*file_arg);
-              if (!p.is_absolute()) p = cwd / p;
+              if (!p.is_absolute()) p = ctx_res->cwd / p;
               if (!yrs::fs::is_regular_file(p, ec)) {
                 return std::unexpected(yrs::make_err(
                     yrs::ErrKind::NotFound, "missing cpp file: " + p.string()));
               }
-              return yrs::bundle_cpp_path(*cfg_res, p);
+              return yrs::bundle_cpp_path(ctx_res->cfg, p);
             }()
-          : yrs::bundle_latest_cpp(*cfg_res, cwd);
+          : yrs::bundle_latest_cpp(ctx_res->cfg, ctx_res->cwd);
   if (!bundled_res) return std::unexpected(bundled_res.error());
 
   auto clip_res = yrs::clipboard::copy_to_clipboard(bundled_res->content);
@@ -122,14 +136,10 @@ yrs::Result<void> run_bundle(std::optional<std::string_view> file_arg) {
   return {};
 }
 
-yrs::Result<void> run_move() {
-  std::error_code ec;
-  auto cwd = yrs::fs::current_path(ec);
-  if (ec) return std::unexpected(yrs::make_err(yrs::ErrKind::Other, ec.message()));
-
-  auto cfg_res = yrs::AppConfig::discover_for_dir(cwd);
-  if (!cfg_res) return std::unexpected(cfg_res.error());
-  const auto &cfg = *cfg_res;
+yrs::Result<void> run_move(const CliContext &) {
+  auto ctx_res = load_command_context();
+  if (!ctx_res) return std::unexpected(ctx_res.error());
+  const auto &cfg = ctx_res->cfg;
 
   auto move_res = yrs::move_catalog_into_record(cfg);
   if (!move_res) return std::unexpected(move_res.error());
@@ -153,66 +163,62 @@ yrs::Result<void> run_move() {
   return {};
 }
 
-yrs::Result<void> run_stage(const std::vector<std::string_view> &pos_args,
-                            bool dry_run) {
-  std::error_code ec;
-  auto cwd = yrs::fs::current_path(ec);
-  if (ec) return std::unexpected(yrs::make_err(yrs::ErrKind::Other, ec.message()));
-
-  auto cfg_res = yrs::AppConfig::discover_for_dir(cwd);
-  if (!cfg_res) return std::unexpected(cfg_res.error());
-  const auto &cfg = *cfg_res;
+yrs::Result<void> run_stage(const CliContext &cli) {
+  auto ctx_res = load_command_context();
+  if (!ctx_res) return std::unexpected(ctx_res.error());
+  const auto &cfg = ctx_res->cfg;
 
   auto stage_res = [&]() -> yrs::Result<yrs::cph::StageSummary> {
-    if (pos_args.empty()) {
-      return yrs::cph::stage_single_problems(cfg, dry_run);
+    if (cli.pos_args.empty()) {
+      return yrs::cph::stage_single_problems(cfg, cli.dry_run);
     }
-    yrs::fs::path src_arg(pos_args[0]);
+    std::error_code ec;
+    yrs::fs::path src_arg(cli.pos_args[0]);
     if (!src_arg.is_absolute() &&
-        yrs::normalize_path(cwd) != yrs::normalize_path(cfg.workspace_root)) {
-      yrs::fs::path from_cwd = cwd / src_arg;
+        yrs::normalize_path(ctx_res->cwd) !=
+            yrs::normalize_path(cfg.workspace_root)) {
+      yrs::fs::path from_cwd = ctx_res->cwd / src_arg;
       if (yrs::fs::exists(from_cwd, ec)) {
         src_arg = std::move(from_cwd);
       }
       ec.clear();
     }
-    return yrs::cph::stage_directory(cfg, src_arg, pos_args[1], dry_run);
+    return yrs::cph::stage_directory(cfg, src_arg, cli.pos_args[1],
+                                     cli.dry_run);
   }();
   if (!stage_res) return std::unexpected(stage_res.error());
 
-  const char *prefix = dry_run ? "[dry-run] " : "";
+  const char *prefix = cli.dry_run ? "[dry-run] " : "";
   if (stage_res->entries.empty()) {
     std::printf("%sno files to stage\n", prefix);
     return {};
   }
 
   std::printf("%s%s %zu files:\n", prefix,
-              dry_run ? "would stage" : "staged", stage_res->entries.size());
+              cli.dry_run ? "would stage" : "staged",
+              stage_res->entries.size());
   for (const auto &e : stage_res->entries) {
     std::string src_str = ws_rel_str(cfg, e.src_path);
     std::string dst_str = ws_rel_str(cfg, e.dst_path);
     std::printf("  %s -> %s%s\n", src_str.c_str(), dst_str.c_str(),
-                e.bin_removed ? (dry_run ? " (would drop .bin)" : " (-bin)")
+                e.bin_removed ? (cli.dry_run ? " (would drop .bin)" : " (-bin)")
                               : "");
   }
   return {};
 }
 
-yrs::Result<void> run_clean(bool dry_run, bool include_unused) {
-  std::error_code ec;
-  auto cwd = yrs::fs::current_path(ec);
-  if (ec) return std::unexpected(yrs::make_err(yrs::ErrKind::Other, ec.message()));
+yrs::Result<void> run_clean(const CliContext &cli) {
+  auto ctx_res = load_command_context();
+  if (!ctx_res) return std::unexpected(ctx_res.error());
+  const auto &cfg = ctx_res->cfg;
 
-  auto cfg_res = yrs::AppConfig::discover_for_dir(cwd);
-  if (!cfg_res) return std::unexpected(cfg_res.error());
-  const auto &cfg = *cfg_res;
-
-  auto clean_res = yrs::cph::clean_cph_workspace(cfg, dry_run, include_unused);
+  auto clean_res =
+      yrs::cph::clean_cph_workspace(cfg, cli.dry_run, cli.include_unused);
   if (!clean_res) return std::unexpected(clean_res.error());
 
-  const char *prefix = dry_run ? "[dry-run] " : "";
+  const char *prefix = cli.dry_run ? "[dry-run] " : "";
   if (clean_res->removed_bins.empty() && clean_res->removed_unused.empty()) {
-    if (include_unused) {
+    if (cli.include_unused) {
       std::printf("%sno orphan .cph-ng cache files or unused templates\n",
                   prefix);
     } else {
@@ -223,19 +229,20 @@ yrs::Result<void> run_clean(bool dry_run, bool include_unused) {
 
   if (!clean_res->removed_unused.empty()) {
     std::printf("%s%s %zu unused template problem(s):\n", prefix,
-                dry_run ? "would clean" : "cleaned",
+                cli.dry_run ? "would clean" : "cleaned",
                 clean_res->removed_unused.size());
     for (const auto &u : clean_res->removed_unused) {
       std::string s = ws_rel_str(cfg, u.src_path);
       std::printf("  %s (%s)\n", s.c_str(),
-                  dry_run ? "would drop .cpp + .bin" : "dropped .cpp + .bin");
+                  cli.dry_run ? "would drop .cpp + .bin"
+                              : "dropped .cpp + .bin");
     }
   }
 
   if (!clean_res->removed_bins.empty()) {
     if (!clean_res->removed_unused.empty()) std::printf("\n");
     std::printf("%s%s %zu orphan .cph-ng cache files:\n", prefix,
-                dry_run ? "would clean" : "cleaned",
+                cli.dry_run ? "would clean" : "cleaned",
                 clean_res->removed_bins.size());
     for (const auto &b : clean_res->removed_bins) {
       std::string s = ws_rel_str(cfg, b);
@@ -245,17 +252,12 @@ yrs::Result<void> run_clean(bool dry_run, bool include_unused) {
   return {};
 }
 
-yrs::Result<void> run_pack(const std::vector<std::string_view> &pos_args,
-                           bool dry_run) {
-  std::error_code ec;
-  auto cwd = yrs::fs::current_path(ec);
-  if (ec) return std::unexpected(yrs::make_err(yrs::ErrKind::Other, ec.message()));
+yrs::Result<void> run_pack(const CliContext &cli) {
+  auto ctx_res = load_command_context();
+  if (!ctx_res) return std::unexpected(ctx_res.error());
+  const auto &cfg = ctx_res->cfg;
 
-  auto cfg_res = yrs::AppConfig::discover_for_dir(cwd);
-  if (!cfg_res) return std::unexpected(cfg_res.error());
-  const auto &cfg = *cfg_res;
-
-  if (pos_args.empty()) {
+  if (cli.pos_args.empty()) {
     auto groups_res = yrs::cph::list_root_contests(cfg);
     if (!groups_res) return std::unexpected(groups_res.error());
     if (groups_res->empty()) {
@@ -281,20 +283,21 @@ yrs::Result<void> run_pack(const std::vector<std::string_view> &pos_args,
 
   std::optional<std::string_view> selector;
   yrs::fs::path dst_dir;
-  if (pos_args.size() == 1) {
-    dst_dir = yrs::fs::path(pos_args[0]);
+  if (cli.pos_args.size() == 1) {
+    dst_dir = yrs::fs::path(cli.pos_args[0]);
   } else {
-    selector = pos_args[0];
-    dst_dir = yrs::fs::path(pos_args[1]);
+    selector = cli.pos_args[0];
+    dst_dir = yrs::fs::path(cli.pos_args[1]);
   }
 
-  auto pack_res = yrs::cph::pack_contest(cfg, selector, dst_dir, dry_run);
+  auto pack_res =
+      yrs::cph::pack_contest(cfg, selector, dst_dir, cli.dry_run);
   if (!pack_res) return std::unexpected(pack_res.error());
 
-  const char *prefix = dry_run ? "[dry-run] " : "";
+  const char *prefix = cli.dry_run ? "[dry-run] " : "";
   std::printf("%s%s %s (%zu packed, %zu dropped templates):\n", prefix,
-              dry_run ? "would pack" : "packed", pack_res->info.key.c_str(),
-              pack_res->packed_files.size(),
+              cli.dry_run ? "would pack" : "packed",
+              pack_res->info.key.c_str(), pack_res->packed_files.size(),
               pack_res->dropped_templates.size());
   for (const auto &e : pack_res->packed_files) {
     std::string dst_str = ws_rel_str(cfg, e.dst_path);
@@ -303,25 +306,103 @@ yrs::Result<void> run_pack(const std::vector<std::string_view> &pos_args,
   }
   for (const auto &d : pack_res->dropped_templates) {
     std::printf("  %s (%s)\n", d.filename().c_str(),
-                dry_run ? "would drop template + .bin" : "dropped template");
+                cli.dry_run ? "would drop template + .bin"
+                            : "dropped template");
   }
   return {};
 }
 
-yrs::Result<void> run_status(bool verbose) {
-  std::error_code ec;
-  auto cwd = yrs::fs::current_path(ec);
-  if (ec) return std::unexpected(yrs::make_err(yrs::ErrKind::Other, ec.message()));
+yrs::Result<void> run_status(const CliContext &cli) {
+  auto ctx_res = load_command_context();
+  if (!ctx_res) return std::unexpected(ctx_res.error());
 
-  auto cfg_res = yrs::AppConfig::discover_for_dir(cwd);
-  if (!cfg_res) return std::unexpected(cfg_res.error());
-
-  auto st_res = yrs::cph::inspect_workspace_status(*cfg_res, cwd);
+  auto st_res = yrs::cph::inspect_workspace_status(ctx_res->cfg, ctx_res->cwd);
   if (!st_res) return std::unexpected(st_res.error());
 
-  std::string rendered = yrs::cph::render_workspace_status(*st_res, verbose);
+  std::string rendered =
+      yrs::cph::render_workspace_status(*st_res, cli.verbose);
   std::printf("%s\n", rendered.c_str());
   return {};
+}
+
+enum class PosArgRule {
+  None,
+  ZeroOrOne,
+  ZeroToTwo,
+  ZeroOrTwo,
+};
+
+struct SubcommandSpec {
+  std::string_view name;
+  std::string_view fail_label;
+  bool allow_dry_run;
+  bool allow_unused;
+  bool allow_verbose;
+  PosArgRule pos_rule;
+  yrs::Result<void> (*handler)(const CliContext &);
+};
+
+constexpr std::array<SubcommandSpec, 8> SUBCOMMANDS = {{
+    {"bundle", "bundle failed", false, false, false, PosArgRule::ZeroOrOne,
+     run_bundle},
+    {"check", "check failed", false, false, false, PosArgRule::None, run_check},
+    {"cover-latest", "cover failed", true, false, false, PosArgRule::None,
+     run_cover_latest},
+    {"move", "move failed", false, false, false, PosArgRule::None, run_move},
+    {"pack", "pack failed", true, false, false, PosArgRule::ZeroToTwo,
+     run_pack},
+    {"stage", "stage failed", true, false, false, PosArgRule::ZeroOrTwo,
+     run_stage},
+    {"clean", "clean failed", true, true, false, PosArgRule::None, run_clean},
+    {"status", "status failed", false, false, true, PosArgRule::None,
+     run_status},
+}};
+
+const SubcommandSpec *find_subcommand(std::string_view cmd) {
+  for (const auto &spec : SUBCOMMANDS) {
+    if (spec.name == cmd) return &spec;
+  }
+  return nullptr;
+}
+
+bool validate_pos_args(const SubcommandSpec &spec,
+                       const std::vector<std::string_view> &pos_args) {
+  switch (spec.pos_rule) {
+    case PosArgRule::None:
+      if (!pos_args.empty()) {
+        print_red_err_prefix("error");
+        std::fprintf(stderr, ": unexpected argument `%.*s`\n",
+                     static_cast<int>(pos_args[0].size()), pos_args[0].data());
+        return false;
+      }
+      return true;
+    case PosArgRule::ZeroOrOne:
+      if (pos_args.size() > 1) {
+        print_red_err_prefix("error");
+        std::fprintf(stderr, ": `bundle` accepts at most 1 file path\n");
+        return false;
+      }
+      return true;
+    case PosArgRule::ZeroToTwo:
+      if (pos_args.size() > 2) {
+        print_red_err_prefix("error");
+        std::fprintf(stderr,
+                     ": `pack` expects 0, 1 (<CONTEST_DIR>), or 2 "
+                     "(<CONTEST_ID> <CONTEST_DIR>) arguments\n");
+        return false;
+      }
+      return true;
+    case PosArgRule::ZeroOrTwo:
+      if (!pos_args.empty() && pos_args.size() != 2) {
+        print_red_err_prefix("error");
+        std::fprintf(stderr,
+                     ": `stage` expects either 0 arguments or "
+                     "<SRC_DIR> <WAIT_SUBDIR>\n");
+        return false;
+      }
+      return true;
+  }
+  return false;
 }
 
 }  // namespace
@@ -340,54 +421,43 @@ int main(int argc, char **argv) {
     return 0;
   }
 
-  if (cmd != "bundle" && cmd != "check" && cmd != "cover-latest" &&
-      cmd != "move" && cmd != "pack" && cmd != "stage" && cmd != "clean" &&
-      cmd != "status") {
-    std::fprintf(stderr, "%serror%s: unrecognized subcommand `%s`\n", ANSI_RED,
-                 ANSI_RESET, argv[1]);
+  const SubcommandSpec *spec = find_subcommand(cmd);
+  if (!spec) {
+    print_red_err_prefix("error");
+    std::fprintf(stderr, ": unrecognized subcommand `%s`\n", argv[1]);
     print_help(argv[0]);
     return 2;
   }
 
-  bool dry_run = false;
-  bool include_unused = false;
-  bool verbose = false;
-  std::vector<std::string_view> pos_args;
-
-  bool accepts_dry_run =
-      (cmd == "stage" || cmd == "clean" || cmd == "pack" ||
-       cmd == "cover-latest");
-  bool accepts_unused = (cmd == "clean");
-  bool accepts_verbose = (cmd == "status");
-
+  CliContext cli;
   for (int i = 2; i < argc; ++i) {
     std::string_view arg = argv[i];
     if (arg == "-h" || arg == "--help") {
       print_help(argv[0]);
       return 0;
     }
-    if (arg == "--dry-run" && accepts_dry_run) {
-      dry_run = true;
+    if (arg == "--dry-run" && spec->allow_dry_run) {
+      cli.dry_run = true;
       continue;
     }
-    if (arg == "--unused" && accepts_unused) {
-      include_unused = true;
+    if (arg == "--unused" && spec->allow_unused) {
+      cli.include_unused = true;
       continue;
     }
-    if (arg == "--verbose" && accepts_verbose) {
-      verbose = true;
+    if (arg == "--verbose" && spec->allow_verbose) {
+      cli.verbose = true;
       continue;
     }
     if (arg.size() >= 2 && arg[0] == '-' && arg[1] != '-') {
       bool ok = true;
       for (size_t k = 1; k < arg.size(); ++k) {
         char f = arg[k];
-        if (f == 'n' && accepts_dry_run) {
-          dry_run = true;
-        } else if (f == 'u' && accepts_unused) {
-          include_unused = true;
-        } else if (f == 'v' && accepts_verbose) {
-          verbose = true;
+        if (f == 'n' && spec->allow_dry_run) {
+          cli.dry_run = true;
+        } else if (f == 'u' && spec->allow_unused) {
+          cli.include_unused = true;
+        } else if (f == 'v' && spec->allow_verbose) {
+          cli.verbose = true;
         } else {
           ok = false;
           break;
@@ -396,95 +466,24 @@ int main(int argc, char **argv) {
       if (ok) continue;
     }
     if (arg.starts_with("-")) {
-      std::fprintf(stderr, "%serror%s: unexpected flag `%s`\n", ANSI_RED,
-                   ANSI_RESET, argv[i]);
+      print_red_err_prefix("error");
+      std::fprintf(stderr, ": unexpected flag `%s`\n", argv[i]);
       return 2;
     }
-    pos_args.push_back(arg);
+    cli.pos_args.push_back(arg);
   }
 
-  if ((cmd == "check" || cmd == "move" || cmd == "clean" ||
-       cmd == "cover-latest" || cmd == "status") &&
-      !pos_args.empty()) {
-    std::fprintf(stderr, "%serror%s: unexpected argument `%.*s`\n", ANSI_RED,
-                 ANSI_RESET, static_cast<int>(pos_args[0].size()),
-                 pos_args[0].data());
-    return 2;
-  }
-  if (cmd == "bundle" && pos_args.size() > 1) {
-    std::fprintf(stderr, "%serror%s: `bundle` accepts at most 1 file path\n",
-                 ANSI_RED, ANSI_RESET);
-    return 2;
-  }
-  if (cmd == "pack" && pos_args.size() > 2) {
-    std::fprintf(stderr,
-                 "%serror%s: `pack` expects 0, 1 (<CONTEST_DIR>), or 2 "
-                 "(<CONTEST_ID> <CONTEST_DIR>) arguments\n",
-                 ANSI_RED, ANSI_RESET);
-    return 2;
-  }
-  if (cmd == "stage" && !pos_args.empty() && pos_args.size() != 2) {
-    std::fprintf(stderr,
-                 "%serror%s: `stage` expects either 0 arguments or "
-                 "<SRC_DIR> <WAIT_SUBDIR>\n",
-                 ANSI_RED, ANSI_RESET);
+  if (!validate_pos_args(*spec, cli.pos_args)) {
     return 2;
   }
 
   std::printf("\n%.*s\n\n", static_cast<int>(yrs::ciallo().size()),
               yrs::ciallo().data());
 
-  if (cmd == "bundle") {
-    std::optional<std::string_view> file_arg;
-    if (!pos_args.empty()) file_arg = pos_args[0];
-    if (auto r = run_bundle(file_arg); !r) {
-      std::fprintf(stderr, "%sbundle failed%s: %s\n", ANSI_RED, ANSI_RESET,
-                   r.error().message.c_str());
-      return 1;
-    }
-  } else if (cmd == "check") {
-    if (auto r = run_check(); !r) {
-      std::fprintf(stderr, "%scheck failed%s: %s\n", ANSI_RED, ANSI_RESET,
-                   r.error().message.c_str());
-      return 1;
-    }
-  } else if (cmd == "cover-latest") {
-    if (auto r = run_cover_latest(dry_run); !r) {
-      std::fprintf(stderr, "%scover failed%s: %s\n", ANSI_RED, ANSI_RESET,
-                   r.error().message.c_str());
-      return 1;
-    }
-  } else if (cmd == "move") {
-    if (auto r = run_move(); !r) {
-      std::fprintf(stderr, "%smove failed%s: %s\n", ANSI_RED, ANSI_RESET,
-                   r.error().message.c_str());
-      return 1;
-    }
-  } else if (cmd == "pack") {
-    if (auto r = run_pack(pos_args, dry_run); !r) {
-      std::fprintf(stderr, "%spack failed%s: %s\n", ANSI_RED, ANSI_RESET,
-                   r.error().message.c_str());
-      return 1;
-    }
-  } else if (cmd == "stage") {
-    if (auto r = run_stage(pos_args, dry_run); !r) {
-      std::fprintf(stderr, "%sstage failed%s: %s\n", ANSI_RED, ANSI_RESET,
-                   r.error().message.c_str());
-      return 1;
-    }
-  } else if (cmd == "clean") {
-    if (auto r = run_clean(dry_run, include_unused); !r) {
-      std::fprintf(stderr, "%sclean failed%s: %s\n", ANSI_RED, ANSI_RESET,
-                   r.error().message.c_str());
-      return 1;
-    }
-  } else if (cmd == "status") {
-    if (auto r = run_status(verbose); !r) {
-      std::fprintf(stderr, "%sstatus failed%s: %s\n", ANSI_RED, ANSI_RESET,
-                   r.error().message.c_str());
-      return 1;
-    }
+  if (auto r = spec->handler(cli); !r) {
+    print_red_err_prefix(spec->fail_label);
+    std::fprintf(stderr, ": %s\n", r.error().message.c_str());
+    return 1;
   }
-
   return 0;
 }

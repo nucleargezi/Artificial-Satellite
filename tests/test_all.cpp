@@ -1,9 +1,12 @@
-#include "../src/yrs.hpp"
+#include "yrs.hpp"
 
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <utime.h>
 
 namespace {
@@ -128,16 +131,23 @@ void test_config_load() {
 void test_latest_and_cover() {
   {
     TempDir tmp;
-    assert(!yrs::find_latest_cpp(tmp.path).value().has_value());
+    write_default_config(tmp.path);
+    auto tpl = write_file(tmp.path, "0.cpp", "template");
+    set_mtime(tpl, 100);
+    auto cfg = yrs::AppConfig::load_for_dir(tmp.path).value();
+    assert(!yrs::find_latest_active_cpp(cfg).value().has_value());
     auto fi = write_file(tmp.path, "a.cpp", "");
     set_mtime(fi, 10);
-    assert(yrs::find_latest_cpp(tmp.path).value() == fi);
+    assert(yrs::normalize_path(*yrs::find_latest_active_cpp(cfg).value()) ==
+           yrs::normalize_path(fi));
     auto se = write_file(tmp.path, "b.cpp", "");
     set_mtime(se, 20);
-    assert(yrs::find_latest_cpp(tmp.path).value() == se);
+    assert(yrs::normalize_path(*yrs::find_latest_active_cpp(cfg).value()) ==
+           yrs::normalize_path(se));
     auto sub = write_file(tmp.path / "sub", "c.cpp", "");
     set_mtime(sub, 30);
-    assert(yrs::find_latest_cpp(tmp.path).value() == se);
+    assert(yrs::normalize_path(*yrs::find_latest_active_cpp(cfg).value()) ==
+           yrs::normalize_path(sub));
   }
   {
     TempDir tmp;
@@ -338,7 +348,7 @@ void test_atomic_write_and_move() {
   set_mtime(target, 1234567);
   fs::path copy_dst = tmp.path / "copied.txt";
   write_file(tmp.path, "copied.txt", "old");
-  assert(yrs::detail::copy_file_atomic(target, copy_dst).has_value());
+  assert(yrs::copy_file_atomic(target, copy_dst).has_value());
   assert(yrs::read_file_to_string(copy_dst).value() == "v2_atomic");
   assert(::stat(copy_dst.c_str(), &sb) == 0);
   assert((sb.st_mode & 0777) == 0640);
@@ -537,6 +547,8 @@ void test_cph_stage_and_clean(const char *cli_bin) {
 
   auto p2075 = write_file(tmp.path, "P2075.cpp", "int main() { return 0; }\n");
   set_mtime(p2075, 1775050000);
+  write_cph_bin(tmp, "000_dup_old_p2075.bin", p2075, "P2075 old",
+                "https://www.luogu.com.cn/problem/P2075", tc_wa);
   write_cph_bin(tmp, "P2075.cpp.bin", p2075, "P2075 区间 LIS",
                 "https://www.luogu.com.cn/problem/P2075", tc_all_ac);
 
@@ -612,6 +624,7 @@ void test_cph_stage_and_clean(const char *cli_bin) {
   auto dry_stage = yrs::cph::stage_single_problems(cfg, true).value();
   assert(dry_stage.entries.size() == 7);
   assert(fs::exists(p2075));
+  assert(fs::exists(tmp.path / ".cph-ng" / "000_dup_old_p2075.bin"));
   assert(fs::exists(tmp.path / ".cph-ng" / "P2075.cpp.bin"));
   assert(!fs::exists(tmp.path / ".wait" / "luogu" / "P2075.cpp"));
 
@@ -619,6 +632,7 @@ void test_cph_stage_and_clean(const char *cli_bin) {
   auto real_stage = yrs::cph::stage_single_problems(cfg, false).value();
   assert(real_stage.entries.size() == 7);
   assert(!fs::exists(p2075));
+  assert(!fs::exists(tmp.path / ".cph-ng" / "000_dup_old_p2075.bin"));
   assert(!fs::exists(tmp.path / ".cph-ng" / "P2075.cpp.bin"));
   assert(!fs::exists(tmp.path / ".cph-ng" / "B2104.cpp.bin"));
 
@@ -777,6 +791,9 @@ void test_cph_pack(const char *cli_bin) {
   // Contest 1: qoj:1540 (2 modified including 1 WA, 1 untouched template)
   auto q_a = write_file(tmp.path, "qoj8328.cpp", "int a_sol() { return 1; }\n");
   set_mtime(q_a, 1775070000);
+  write_cph_bin(tmp, "000_dup_q8328.bin", q_a, "A. old",
+                "https://qoj.ac/contest/1540/problem/8328/statement/zh_cn",
+                tc_wa);
   write_cph_bin(tmp, "qoj8328.cpp.bin", q_a, "A. 一道好题",
                 "https://qoj.ac/contest/1540/problem/8328/statement/zh_cn",
                 tc_all_ac);
@@ -785,6 +802,9 @@ void test_cph_pack(const char *cli_bin) {
       tmp.path, "qoj8329.cpp",
       "#include \"YRS/all.hpp\"\r\nvoid Yorisou() {\r\n}\r\nint main() {}\r\n");
   set_mtime(q_b, 1775070100);
+  write_cph_bin(tmp, "000_dup_q8329.bin", q_b, "B. old",
+                "https://qoj.ac/contest/1540/problem/8329/statement/zh_cn",
+                tc_wa);
   write_cph_bin(tmp, "qoj8329.cpp.bin", q_b, "B. 空题",
                 "https://qoj.ac/contest/1540/problem/8329/statement/zh_cn",
                 tc_wa);
@@ -845,6 +865,8 @@ void test_cph_pack(const char *cli_bin) {
   assert(fs::exists(dst_a) && fs::exists(dst_m));
   assert(!fs::exists(tmp.path / "2023 ccpc shenzhen" / "B.cpp"));
   assert(!fs::exists(q_a) && !fs::exists(q_b) && !fs::exists(q_m));
+  assert(!fs::exists(tmp.path / ".cph-ng" / "000_dup_q8328.bin"));
+  assert(!fs::exists(tmp.path / ".cph-ng" / "000_dup_q8329.bin"));
   assert(!fs::exists(tmp.path / ".cph-ng" / "qoj8328.cpp.bin"));
   assert(!fs::exists(tmp.path / ".cph-ng" / "qoj8329.cpp.bin"));
   assert(!fs::exists(tmp.path / ".cph-ng" / "qoj8340.cpp.bin"));
