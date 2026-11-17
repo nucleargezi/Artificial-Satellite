@@ -1,3 +1,4 @@
-/target
+/yrs-cli
+/*.o
 /.vscode
 .codex
